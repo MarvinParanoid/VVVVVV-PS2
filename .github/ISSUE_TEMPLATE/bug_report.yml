@@ -1,0 +1,41 @@
+name: Bug report (build, packaging or PCSX2)
+description: Something in the build scripts, the USB packaging or the PCSX2 behaviour is wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For results from a real console, please use the **Hardware test report** template instead.
+        **Do not attach game data** (`data.zip`, `data-ps2.zip`, extracted assets) or BIOS files.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Commands and output
+      description: The exact commands and the last ~50 lines of output.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host system
+      description: OS and version; Docker or bubblewrap backend (scripts/ps2-env.sh picks one).
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Repository revision
+      description: Output of `git rev-parse --short HEAD`, and the build ID if relevant.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: For PCSX2 runs, `logs/pcsx2/<run>/vvvvvv_ps2.log` and `emulog.txt` (text only, no screenshots of game data needed).

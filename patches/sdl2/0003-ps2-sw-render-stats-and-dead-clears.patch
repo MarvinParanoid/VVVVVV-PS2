@@ -1,0 +1,174 @@
+--- a/src/render/software/SDL_render_sw.c
++++ b/src/render/software/SDL_render_sw.c
+@@ -693,7 +693,114 @@
+     }
+ }
+ 
+-static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
++#ifdef __PS2__
++#include <timer.h>
++
++/* Diagnostics for the VVVVVV PS2 port (docs/ps2-p3-report.md). Not a public
++ * API: callers declare this struct themselves. Times are in microseconds and
++ * accumulate until the caller resets them. */
++typedef struct
++{
++    Uint64 runs;         /* command queue flushes */
++    Uint64 queue_us;     /* time spent executing them (all blits and fills) */
++    Uint64 cmds[16];     /* commands executed, by SDL_RenderCommandType */
++    Uint64 dead_clears;  /* clears dropped by SW_DropDeadClears */
++    struct {             /* copies by kind: src/dst format, blend mode, modulation */
++        Uint32 src_format, dst_format, blend, mod; /* mod: 1 colour, 2 alpha */
++        Uint64 count, pixels;
++    } kinds[24];
++} SW_RenderStats;
++
++SW_RenderStats SW_render_stats;
++int SW_render_stats_kinds; /* set by the caller to count copies by kind (costs ~2% in tile-heavy frames) */
++
++static void SW_CountCopy(const SDL_RenderCommand *cmd, SDL_Surface *dst, int w, int h)
++{
++    const Uint32 sf = cmd->data.draw.texture->format, df = dst->format->format, bl = (Uint32)cmd->data.draw.blend;
++    const Uint32 mod = ((cmd->data.draw.r & cmd->data.draw.g & cmd->data.draw.b) != 255 ? 1 : 0) | (cmd->data.draw.a != 255 ? 2 : 0);
++    int i;
++    for (i = 0; i < 24; i++) {
++        if (SW_render_stats.kinds[i].count == 0) {
++            SW_render_stats.kinds[i].src_format = sf;
++            SW_render_stats.kinds[i].dst_format = df;
++            SW_render_stats.kinds[i].blend = bl;
++            SW_render_stats.kinds[i].mod = mod;
++        }
++        if (SW_render_stats.kinds[i].src_format == sf && SW_render_stats.kinds[i].dst_format == df &&
++            SW_render_stats.kinds[i].blend == bl && SW_render_stats.kinds[i].mod == mod) {
++            SW_render_stats.kinds[i].count++;
++            SW_render_stats.kinds[i].pixels += (Uint64)w * h;
++            return;
++        }
++    }
++}
++#define SW_COUNT_COPY(cmd, dst, w, h) if (SW_render_stats_kinds) SW_CountCopy(cmd, dst, w, h)
++#else
++#define SW_COUNT_COPY(cmd, dst, w, h)
++#endif
++
++#ifdef __PS2__
++extern SDL_bool SDL_PS2P3FastpathsEnabled(void); /* SDL_blit.c */
++
++/* SDL_PS2_P3_FASTPATHS: a CLEAR is dropped when every pixel it writes is
++ * overwritten before anything reads it: the next command in this batch that
++ * touches pixels is another CLEAR, or an unscaled COPY without blending whose
++ * destination, after the same viewport/clip handling as SetDrawState and the
++ * COPY case below, covers the whole surface. Output is unchanged. */
++static void SW_DropDeadClears(SDL_Surface *surface, SDL_RenderCommand *cmd, void *vertices)
++{
++    const SDL_Rect *viewport = NULL, *cliprect = NULL;
++    for (; cmd; cmd = cmd->next) {
++        if (cmd->command == SDL_RENDERCMD_SETVIEWPORT) {
++            viewport = &cmd->data.viewport.rect;
++        } else if (cmd->command == SDL_RENDERCMD_SETCLIPRECT) {
++            cliprect = cmd->data.cliprect.enabled ? &cmd->data.cliprect.rect : NULL;
++        } else if (cmd->command == SDL_RENDERCMD_CLEAR) {
++            const SDL_Rect *vp = viewport, *clip = cliprect;
++            SDL_RenderCommand *next;
++            SDL_bool dead = SDL_FALSE;
++            for (next = cmd->next; next; next = next->next) {
++                if (next->command == SDL_RENDERCMD_SETVIEWPORT) {
++                    vp = &next->data.viewport.rect;
++                } else if (next->command == SDL_RENDERCMD_SETCLIPRECT) {
++                    clip = next->data.cliprect.enabled ? &next->data.cliprect.rect : NULL;
++                } else if (next->command == SDL_RENDERCMD_SETDRAWCOLOR || next->command == SDL_RENDERCMD_NO_OP) {
++                    continue;
++                } else {
++                    if (next->command == SDL_RENDERCMD_CLEAR) {
++                        dead = SDL_TRUE;
++                    } else if (next->command == SDL_RENDERCMD_COPY && next->data.draw.blend == SDL_BLENDMODE_NONE && vp) {
++                        const SDL_Rect *verts = (const SDL_Rect *)(((const Uint8 *)vertices) + next->data.draw.first);
++                        const SDL_Rect full = { 0, 0, surface->w, surface->h };
++                        SDL_Rect dst = verts[1], area, eff;
++                        dst.x += vp->x;
++                        dst.y += vp->y;
++                        if (clip) {
++                            eff.x = clip->x + vp->x;
++                            eff.y = clip->y + vp->y;
++                            eff.w = clip->w;
++                            eff.h = clip->h;
++                            SDL_IntersectRect(vp, &eff, &eff);
++                        } else {
++                            eff = *vp;
++                        }
++                        dead = verts[0].w == verts[1].w && verts[0].h == verts[1].h &&
++                               SDL_IntersectRect(&dst, &eff, &area) && SDL_IntersectRect(&area, &full, &area) &&
++                               area.x == 0 && area.y == 0 && area.w == full.w && area.h == full.h;
++                    }
++                    break;
++                }
++            }
++            if (dead) {
++                cmd->command = SDL_RENDERCMD_NO_OP;
++                SW_render_stats.dead_clears++;
++            }
++        }
++    }
++}
++#endif
++
++static int SW_RunCommandQueueImpl(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
+ {
+     SDL_Surface *surface = SW_ActivateRenderer(renderer);
+     SW_DrawStateCache drawstate;
+@@ -706,6 +813,12 @@
+     drawstate.cliprect = NULL;
+     drawstate.surface_cliprect_dirty = SDL_TRUE;
+ 
++#ifdef __PS2__
++    if (SDL_PS2P3FastpathsEnabled()) {
++        SW_DropDeadClears(surface, cmd, vertices);
++    }
++#endif
++
+     while (cmd) {
+         switch (cmd->command) {
+             case SDL_RENDERCMD_SETDRAWCOLOR: {
+@@ -827,6 +940,7 @@
+                 SetDrawState(surface, &drawstate);
+ 
+                 PrepTextureForCopy(cmd);
++                SW_COUNT_COPY(cmd, surface, dstrect->w, dstrect->h);
+ 
+                 /* Apply viewport */
+                 if (drawstate.viewport && (drawstate.viewport->x || drawstate.viewport->y)) {
+@@ -885,6 +999,7 @@
+                 CopyExData *copydata = (CopyExData *) (((Uint8 *) vertices) + cmd->data.draw.first);
+                 SetDrawState(surface, &drawstate);
+                 PrepTextureForCopy(cmd);
++                SW_COUNT_COPY(cmd, surface, copydata->dstrect.w, copydata->dstrect.h);
+ 
+                 /* Apply viewport */
+                 if (drawstate.viewport && (drawstate.viewport->x || drawstate.viewport->y)) {
+@@ -966,6 +1081,26 @@
+     return 0;
+ }
+ 
++
++
++static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
++{
++#ifdef __PS2__
++    const u64 t0 = GetTimerSystemTime();
++    SDL_RenderCommand *c;
++    int result;
++    for (c = cmd; c; c = c->next) {
++        SW_render_stats.cmds[(unsigned) c->command & 15]++;
++    }
++    result = SW_RunCommandQueueImpl(renderer, cmd, vertices, vertsize);
++    SW_render_stats.queue_us += (GetTimerSystemTime() - t0) * 1000 / (kBUSCLK / 1000);
++    SW_render_stats.runs++;
++    return result;
++#else
++    return SW_RunCommandQueueImpl(renderer, cmd, vertices, vertsize);
++#endif
++}
++
+ static int SW_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
+                                Uint32 format, void *pixels, int pitch)
+ {

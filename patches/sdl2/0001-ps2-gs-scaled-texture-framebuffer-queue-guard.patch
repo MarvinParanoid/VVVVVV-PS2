@@ -1,0 +1,526 @@
+diff -ruN a/include/SDL_hints.h b0001/include/SDL_hints.h
+--- a/include/SDL_hints.h	2025-02-25 17:08:55.000000000 +0100
++++ b0001/include/SDL_hints.h	2026-10-21 22:50:24.526303792 +0200
+@@ -2039,6 +2039,39 @@
+ #define SDL_HINT_PS2_DYNAMIC_VSYNC    "SDL_PS2_DYNAMIC_VSYNC"
+ 
+ /**
++ * PS2: report a fixed pixel size for windows (e.g. "320x240"), read when
++ * the window is created.
++ *
++ * A software renderer / window surface then works at this size and the
++ * texture framebuffer is scaled to the full GS display by the GS itself,
++ * instead of by the CPU. Unset (default): pixel size equals window size.
++ */
++#define SDL_HINT_PS2_WINDOW_PIXEL_SIZE "SDL_PS2_WINDOW_PIXEL_SIZE"
++
++/**
++ * PS2: list SDL_PIXELFORMAT_XBGR8888 first among the gsKit renderer's
++ * texture formats, so the texture framebuffer is 32-bit instead of
++ * ABGR1555. Read at renderer creation. "0" (default) or "1".
++ */
++#define SDL_HINT_PS2_PREFER_XBGR8888 "SDL_PS2_PREFER_XBGR8888"
++
++/**
++ * PS2: size in bytes of each of the two gsKit oneshot render queues, and of
++ * the (unused by SDL) persistent queue. Read at renderer creation.
++ * Defaults: 2097152 and 262144. Queue space is checked before every command
++ * and the queue is flushed early when needed, so small values are safe.
++ */
++#define SDL_HINT_PS2_RENDER_QUEUE_SIZE "SDL_PS2_RENDER_QUEUE_SIZE"
++#define SDL_HINT_PS2_RENDER_PERSISTENT_QUEUE_SIZE "SDL_PS2_RENDER_PERSISTENT_QUEUE_SIZE"
++
++/**
++ * PS2: scale vertex colour and alpha (and texture alpha on upload) from
++ * 0..255 to the GS range where 0x80 == 1.0. "1" (default) or "0" for the
++ * unscaled behaviour of SDL 2.32.10.
++ */
++#define SDL_HINT_PS2_GS_COLOR_SCALE "SDL_PS2_GS_COLOR_SCALE"
++
++/**
+  * A variable to control whether the return key on the soft keyboard should
+  * hide the soft keyboard on Android and iOS.
+  *
+diff -ruN a/src/render/ps2/SDL_render_ps2.c b0001/src/render/ps2/SDL_render_ps2.c
+--- a/src/render/ps2/SDL_render_ps2.c	2025-05-20 20:12:16.000000000 +0200
++++ b0001/src/render/ps2/SDL_render_ps2.c	2026-10-21 23:14:59.122568551 +0200
+@@ -26,6 +26,7 @@
+ #include "SDL_hints.h"
+ 
+ #include <kernel.h>
++#include <timer.h>
+ #include <malloc.h>
+ #include <gsKit.h>
+ #include <dmaKit.h>
+@@ -42,6 +43,13 @@
+ #define RENDER_QUEUE_PER_POOLSIZE 1024 * 256 // 256K of persistent renderqueue
+ /* Size of Oneshot drawbuffer (Double Buffered, so it uses this size * 2) */
+ #define RENDER_QUEUE_OS_POOLSIZE 1024 * 1024 * 2 // 2048K of oneshot renderqueue
++/* Smallest queue accepted from SDL_HINT_PS2_RENDER_*QUEUE_SIZE */
++#define RENDER_QUEUE_MIN_POOLSIZE 1024 * 16
++/* Headroom kept free in the oneshot queue for things gsKit appends without
++ * asking (finish token on exec, DMA tag splits, GIF tag fixups). */
++#define RENDER_QUEUE_SLACK 1024
++/* Upper bound for queue bytes needed by one gsKit_TexManager_bind() upload */
++#define RENDER_QUEUE_BIND_BYTES 1024
+ 
+ typedef struct
+ {
+@@ -50,8 +58,88 @@
+     SDL_Rect *viewport;
+     int32_t vsync_callback_id;
+     uint8_t vsync; /* 0 (Disabled), 1 (Enabled), 2 (Dynamic) */
++    SDL_bool color_scale; /* SDL_HINT_PS2_GS_COLOR_SCALE */
+ } PS2_RenderData;
+ 
++/* Diagnostics for the VVVVVV PS2 port's validation tests. Not a public API:
++ * tests declare this struct themselves. Times are in microseconds and
++ * accumulate until the caller resets them. */
++typedef struct
++{
++    uint64_t presents;
++    uint64_t update_us;      /* PS2_UpdateTexture: copy into texture memory */
++    uint64_t queue_build_us; /* RunCommandQueue: building GIF packets, incl. texture upload setup */
++    uint64_t exec_us;        /* gsKit_queue_exec in present: DMA kick (waits for previous GS work) */
++    uint64_t finish_us;      /* gsKit_finish in present: wait for the GS to complete this frame */
++    uint64_t vsync_us;       /* vsync wait in present */
++    uint32_t os_queue_size;  /* bytes per oneshot pool */
++    uint32_t per_queue_size;
++    uint32_t os_queue_peak;  /* max bytes used in a oneshot pool before an exec */
++    uint32_t per_queue_peak;
++    uint32_t early_flushes;  /* queue executed mid-frame to make room */
++    uint32_t oversize_drops; /* draws that could not fit even an empty queue */
++} PS2_RenderStats;
++
++PS2_RenderStats PS2_render_stats;
++
++static uint64_t PS2_NowUs(void)
++{
++    return GetTimerSystemTime() * 1000ULL / (kBUSCLK / 1000ULL);
++}
++
++static uint32_t PS2_QueueUsed(const GSQUEUE *q)
++{
++    return (uint32_t)((uint8_t *)q->pool_cur - (uint8_t *)q->pool[q->dbuf]);
++}
++
++static uint32_t PS2_QueueCapacity(const GSQUEUE *q)
++{
++    return (uint32_t)((uint8_t *)q->pool_max[q->dbuf] - (uint8_t *)q->pool[q->dbuf]);
++}
++
++static void PS2_NoteQueuePeaks(GSGLOBAL *gsGlobal)
++{
++    uint32_t os = PS2_QueueUsed(gsGlobal->Os_Queue);
++    uint32_t per = PS2_QueueUsed(gsGlobal->Per_Queue);
++    if (os > PS2_render_stats.os_queue_peak) {
++        PS2_render_stats.os_queue_peak = os;
++    }
++    if (per > PS2_render_stats.per_queue_peak) {
++        PS2_render_stats.per_queue_peak = per;
++    }
++}
++
++/* gsKit does not bounds-check its queues in release builds. Make sure `bytes`
++ * more fit into the current oneshot pool, executing it early if not.
++ * Returns SDL_FALSE if `bytes` cannot fit even into an empty pool. */
++static SDL_bool PS2_EnsureQueueSpace(GSGLOBAL *gsGlobal, uint32_t bytes)
++{
++    GSQUEUE *q = gsGlobal->CurQueue;
++    uint32_t cap = PS2_QueueCapacity(q);
++
++    if (PS2_QueueUsed(q) + bytes + RENDER_QUEUE_SLACK <= cap) {
++        return SDL_TRUE;
++    }
++    PS2_NoteQueuePeaks(gsGlobal);
++    gsKit_queue_exec(gsGlobal);
++    PS2_render_stats.early_flushes++;
++    return PS2_QueueUsed(q) + bytes + RENDER_QUEUE_SLACK <= cap;
++}
++
++/* Largest vertex count (multiple of `multiple`) that fits an empty pool. */
++static int PS2_MaxVerticesPerChunk(GSGLOBAL *gsGlobal, int vertex_bytes, int multiple)
++{
++    int room = (int)PS2_QueueCapacity(gsGlobal->CurQueue) - RENDER_QUEUE_SLACK - RENDER_QUEUE_BIND_BYTES - 256;
++    int n = room / vertex_bytes;
++    return n - (n % multiple);
++}
++
++/* 0..255 -> GS range where 0x80 means 1.0 (255 -> 128 exactly). */
++static uint8_t PS2_ScaleToGS(uint8_t v)
++{
++    return (uint8_t)(((unsigned)v * 128u + 127u) / 255u);
++}
++
+ static int vsync_sema_id = 0;
+ 
+ /* PRIVATE METHODS */
+@@ -88,6 +176,21 @@
+     gsKit_setactive(gsGlobal);
+ }
+ 
++static int PS2_GetOutputSize(SDL_Renderer *renderer, int *w, int *h)
++{
++    PS2_RenderData *data = (PS2_RenderData *)renderer->driverdata;
++
++    /* The GS framebuffer, not the window size: a texture framebuffer smaller
++     * than this (SDL_HINT_PS2_WINDOW_PIXEL_SIZE) is then scaled by the GS. */
++    if (w) {
++        *w = data->gsGlobal->Width;
++    }
++    if (h) {
++        *h = data->gsGlobal->Height;
++    }
++    return 0;
++}
++
+ static int PixelFormatToPS2PSM(Uint32 format)
+ {
+     switch (format) {
+@@ -148,12 +251,18 @@
+ static int PS2_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
+                              const SDL_Rect *rect, const void *pixels, int pitch)
+ {
++    PS2_RenderData *data = (PS2_RenderData *)renderer->driverdata;
+     const Uint8 *src;
+-    Uint8 *dst;
+-    int row, length, dpitch;
++    Uint8 *dst, *row_start;
++    int row, length, dpitch, x;
++    uint64_t t0 = PS2_NowUs();
++    /* Texture alpha to the GS range; XBGR8888 has no alpha to convert. */
++    const SDL_bool convert_alpha = data->color_scale && SDL_BYTESPERPIXEL(texture->format) == 4 &&
++                                   SDL_ISPIXELFORMAT_ALPHA(texture->format);
+     src = pixels;
+ 
+     PS2_LockTexture(renderer, texture, rect, (void **)&dst, &dpitch);
++    row_start = dst;
+     length = rect->w * SDL_BYTESPERPIXEL(texture->format);
+     if (length == pitch && length == dpitch) {
+         SDL_memcpy(dst, src, length * rect->h);
+@@ -164,8 +273,16 @@
+             dst += dpitch;
+         }
+     }
++    if (convert_alpha) {
++        for (row = 0; row < rect->h; ++row, row_start += dpitch) {
++            for (x = 0; x < rect->w; ++x) {
++                row_start[x * 4 + 3] = PS2_ScaleToGS(row_start[x * 4 + 3]);
++            }
++        }
++    }
+ 
+     PS2_UnlockTexture(renderer, texture);
++    PS2_render_stats.update_us += PS2_NowUs() - t0;
+ 
+     return 0;
+ }
+@@ -225,7 +342,7 @@
+     colorR = cmd->data.draw.r;
+     colorG = cmd->data.draw.g;
+     colorB = cmd->data.draw.b;
+-    colorA = cmd->data.draw.a;
++    colorA = data->color_scale ? PS2_ScaleToGS(cmd->data.draw.a) : cmd->data.draw.a;
+     rgbaq = color_to_RGBAQ(colorR, colorG, colorB, colorA, 0.0f);
+ 
+     for (i = 0; i < count; i++, vertices++, points++) {
+@@ -275,7 +392,13 @@
+             uv_ = (float *)((char *)uv + j * uv_stride);
+ 
+             vertices->xyz2 = vertex_to_XYZ2(data->gsGlobal, xy_[0] * scale_x, xy_[1] * scale_y, 0);
+-            vertices->rgbaq = color_to_RGBAQ(col_.r, col_.g, col_.b, col_.a, 0);
++            if (data->color_scale) {
++                /* TEX0.TFX is MODULATE: output = texel * vertex / 0x80 */
++                vertices->rgbaq = color_to_RGBAQ(PS2_ScaleToGS(col_.r), PS2_ScaleToGS(col_.g),
++                                                 PS2_ScaleToGS(col_.b), PS2_ScaleToGS(col_.a), 0);
++            } else {
++                vertices->rgbaq = color_to_RGBAQ(col_.r, col_.g, col_.b, col_.a, 0);
++            }
+             vertices->uv = vertex_to_UV(ps2_tex, uv_[0] * ps2_tex->Width, uv_[1] * ps2_tex->Height);
+ 
+             vertices++;
+@@ -306,7 +429,8 @@
+             col_ = *(SDL_Color *)((char *)color + j * color_stride);
+ 
+             vertices->xyz2 = vertex_to_XYZ2(data->gsGlobal, xy_[0] * scale_x, xy_[1] * scale_y, 0);
+-            vertices->rgbaq = color_to_RGBAQ(col_.r, col_.g, col_.b, col_.a, 0.0f);
++            vertices->rgbaq = color_to_RGBAQ(col_.r, col_.g, col_.b,
++                                             data->color_scale ? PS2_ScaleToGS(col_.a) : col_.a, 0.0f);
+ 
+             vertices++;
+         }
+@@ -372,7 +496,17 @@
+     offsetY = data->gsGlobal->OffsetY;
+     data->gsGlobal->OffsetX = (int)(2048.0f * 16.0f);
+     data->gsGlobal->OffsetY = (int)(2048.0f * 16.0f);
+-    gsKit_clear(data->gsGlobal, GS_SETREG_RGBAQ(colorR, colorG, colorB, colorA, 0x00));
++    PS2_EnsureQueueSpace(data->gsGlobal, 4096);
++    if (data->color_scale) {
++        /* gsKit_clear() draws sprites with the current PrimAlphaEnable; a
++         * clear must overwrite, not blend (alpha 255 would mean 2.0 here) */
++        int alpha_enable = data->gsGlobal->PrimAlphaEnable;
++        data->gsGlobal->PrimAlphaEnable = GS_SETTING_OFF;
++        gsKit_clear(data->gsGlobal, GS_SETREG_RGBAQ(colorR, colorG, colorB, colorA, 0x00));
++        data->gsGlobal->PrimAlphaEnable = alpha_enable;
++    } else {
++        gsKit_clear(data->gsGlobal, GS_SETREG_RGBAQ(colorR, colorG, colorB, colorA, 0x00));
++    }
+ 
+     /* Put back original offset */
+     data->gsGlobal->OffsetX = offsetX;
+@@ -433,12 +567,37 @@
+     if (cmd->data.draw.texture) {
+         const GSPRIMUVPOINT *verts = (GSPRIMUVPOINT *) (vertices + cmd->data.draw.first);
+         GSTEXTURE *ps2_tex = (GSTEXTURE *)cmd->data.draw.texture->driverdata;
++        const int max_chunk = PS2_MaxVerticesPerChunk(data->gsGlobal, sizeof(GSPRIMUVPOINT), 3);
++        size_t done = 0;
+ 
+-        gsKit_TexManager_bind(data->gsGlobal, ps2_tex);
+-        gsKit_prim_list_triangle_goraud_texture_uv_3d(data->gsGlobal, ps2_tex, count, verts);
++        if (max_chunk < 3) {
++            PS2_render_stats.oversize_drops++;
++            return 0;
++        }
++        /* bind and each chunk re-check space; a flush in between is safe
++         * because the texture stays resident until TexManager_nextFrame */
++        while (done < count) {
++            int n = (int)SDL_min((size_t)max_chunk, count - done);
++            PS2_EnsureQueueSpace(data->gsGlobal, RENDER_QUEUE_BIND_BYTES + (uint32_t)n * sizeof(GSPRIMUVPOINT) + 64);
++            gsKit_TexManager_bind(data->gsGlobal, ps2_tex);
++            gsKit_prim_list_triangle_goraud_texture_uv_3d(data->gsGlobal, ps2_tex, n, verts + done);
++            done += n;
++        }
+     } else {
+         const GSPRIMPOINT *verts = (GSPRIMPOINT *)(vertices + cmd->data.draw.first);
+-        gsKit_prim_list_triangle_gouraud_3d(data->gsGlobal, count, verts);
++        const int max_chunk = PS2_MaxVerticesPerChunk(data->gsGlobal, sizeof(GSPRIMPOINT), 3);
++        size_t done = 0;
++
++        if (max_chunk < 3) {
++            PS2_render_stats.oversize_drops++;
++            return 0;
++        }
++        while (done < count) {
++            int n = (int)SDL_min((size_t)max_chunk, count - done);
++            PS2_EnsureQueueSpace(data->gsGlobal, (uint32_t)n * sizeof(GSPRIMPOINT) + 64);
++            gsKit_prim_list_triangle_gouraud_3d(data->gsGlobal, n, verts + done);
++            done += n;
++        }
+     }
+ 
+     return 0;
+@@ -450,8 +609,16 @@
+     const size_t count = cmd->data.draw.count;
+     const GSPRIMPOINT *verts = (GSPRIMPOINT *)(vertices + cmd->data.draw.first);
+ 
++    const int max_chunk = PS2_MaxVerticesPerChunk(data->gsGlobal, sizeof(GSPRIMPOINT), 2);
++    size_t done = 0;
++
+     PS2_SetBlendMode(data, cmd->data.draw.blend);
+-    gsKit_prim_list_line_goraud_3d(data->gsGlobal, count, verts);
++    while (done < count && max_chunk >= 2) {
++        int n = (int)SDL_min((size_t)max_chunk, count - done);
++        PS2_EnsureQueueSpace(data->gsGlobal, (uint32_t)n * sizeof(GSPRIMPOINT) + 64);
++        gsKit_prim_list_line_goraud_3d(data->gsGlobal, n, verts + done);
++        done += n;
++    }
+ 
+     /* We're done! */
+     return 0;
+@@ -463,8 +630,16 @@
+     const size_t count = cmd->data.draw.count;
+     const GSPRIMPOINT *verts = (GSPRIMPOINT *)(vertices + cmd->data.draw.first);
+ 
++    const int max_chunk = PS2_MaxVerticesPerChunk(data->gsGlobal, sizeof(GSPRIMPOINT), 1);
++    size_t done = 0;
++
+     PS2_SetBlendMode(data, cmd->data.draw.blend);
+-    gsKit_prim_list_points(data->gsGlobal, count, verts);
++    while (done < count && max_chunk >= 1) {
++        int n = (int)SDL_min((size_t)max_chunk, count - done);
++        PS2_EnsureQueueSpace(data->gsGlobal, (uint32_t)n * sizeof(GSPRIMPOINT) + 64);
++        gsKit_prim_list_points(data->gsGlobal, n, verts + done);
++        done += n;
++    }
+ 
+     /* We're done! */
+     return 0;
+@@ -472,7 +647,12 @@
+ 
+ static int PS2_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
+ {
++    PS2_RenderData *data = (PS2_RenderData *)renderer->driverdata;
++    uint64_t t0 = PS2_NowUs();
++
+     while (cmd) {
++        /* register writes (scissor, alpha, texfilter) go through the queue too */
++        PS2_EnsureQueueSpace(data->gsGlobal, 256);
+         switch (cmd->command) {
+         case SDL_RENDERCMD_SETVIEWPORT:
+         {
+@@ -521,6 +701,7 @@
+         }
+         cmd = cmd->next;
+     }
++    PS2_render_stats.queue_build_us += PS2_NowUs() - t0;
+     return 0;
+ }
+ 
+@@ -533,25 +714,40 @@
+ static int PS2_RenderPresent(SDL_Renderer *renderer)
+ {
+     PS2_RenderData *data = (PS2_RenderData *)renderer->driverdata;
++    uint64_t t0, t1, t2, t3;
+ 
++    PS2_NoteQueuePeaks(data->gsGlobal);
++    t0 = PS2_NowUs();
+     if (data->gsGlobal->DoubleBuffering == GS_SETTING_OFF) {
+         if (data->vsync == 2) { // Dynamic
+             gsKit_sync(data->gsGlobal);
+         } else if (data->vsync == 1) {
+             gsKit_vsync_wait();
+         }
++        t1 = t2 = PS2_NowUs();
+         gsKit_queue_exec(data->gsGlobal);
++        t3 = PS2_NowUs();
++        PS2_render_stats.vsync_us += t1 - t0;
++        PS2_render_stats.exec_us += t3 - t2;
+     } else {
+         gsKit_queue_exec(data->gsGlobal);
++        t1 = PS2_NowUs();
+         gsKit_finish();
++        t2 = PS2_NowUs();
+         if (data->vsync == 2) { // Dynamic
+             gsKit_sync(data->gsGlobal);
+         } else if (data->vsync == 1) {
+             gsKit_vsync_wait();
+         }
+         gsKit_flip(data->gsGlobal);
++        t3 = PS2_NowUs();
++        PS2_render_stats.exec_us += t1 - t0;
++        PS2_render_stats.finish_us += t2 - t1;
++        PS2_render_stats.vsync_us += t3 - t2;
+     }
++    PS2_render_stats.presents++;
+     gsKit_TexManager_nextFrame(data->gsGlobal);
++    PS2_EnsureQueueSpace(data->gsGlobal, 4096);
+     gsKit_clear(data->gsGlobal, GS_BLACK);
+     return 0;
+ }
+@@ -609,6 +805,12 @@
+     GSGLOBAL *gsGlobal;
+     ee_sema_t sema;
+     SDL_bool dynamicVsync;
++    int os_size = SDL_GetHint(SDL_HINT_PS2_RENDER_QUEUE_SIZE) ? SDL_atoi(SDL_GetHint(SDL_HINT_PS2_RENDER_QUEUE_SIZE)) : RENDER_QUEUE_OS_POOLSIZE;
++    int per_size = SDL_GetHint(SDL_HINT_PS2_RENDER_PERSISTENT_QUEUE_SIZE) ? SDL_atoi(SDL_GetHint(SDL_HINT_PS2_RENDER_PERSISTENT_QUEUE_SIZE)) : RENDER_QUEUE_PER_POOLSIZE;
++
++    /* gsKit_alloc_ucab() uses 64-byte aligned pools */
++    os_size = (SDL_max(os_size, RENDER_QUEUE_MIN_POOLSIZE) + 63) & ~63;
++    per_size = (SDL_max(per_size, RENDER_QUEUE_MIN_POOLSIZE) + 63) & ~63;
+ 
+     data = (PS2_RenderData *)SDL_calloc(1, sizeof(*data));
+     if (!data) {
+@@ -622,7 +824,9 @@
+     sema.option = 0;
+     vsync_sema_id = CreateSema(&sema);
+ 
+-    gsGlobal = gsKit_init_global_custom(RENDER_QUEUE_OS_POOLSIZE, RENDER_QUEUE_PER_POOLSIZE);
++    gsGlobal = gsKit_init_global_custom(os_size, per_size);
++    PS2_render_stats.os_queue_size = (uint32_t)os_size;
++    PS2_render_stats.per_queue_size = (uint32_t)per_size;
+ 
+     gsGlobal->Mode = GS_MODE_NTSC;
+     gsGlobal->Height = 448;
+@@ -675,7 +879,18 @@
+     renderer->DestroyTexture = PS2_DestroyTexture;
+     renderer->DestroyRenderer = PS2_DestroyRenderer;
+     renderer->SetVSync = PS2_SetVSync;
++    renderer->GetOutputSize = PS2_GetOutputSize;
+     renderer->info = PS2_RenderDriver.info;
++    data->color_scale = SDL_GetHintBoolean(SDL_HINT_PS2_GS_COLOR_SCALE, SDL_TRUE);
++    if (SDL_GetHintBoolean(SDL_HINT_PS2_PREFER_XBGR8888, SDL_FALSE)) {
++        /* SDL_CreateWindowTexture() takes the first format without alpha, so
++         * listing XBGR8888 at all makes the texture framebuffer 32-bit;
++         * without the hint the list (and ABGR1555 framebuffer) is unchanged. */
++        renderer->info.num_texture_formats = 3;
++        renderer->info.texture_formats[0] = SDL_PIXELFORMAT_XBGR8888;
++        renderer->info.texture_formats[1] = SDL_PIXELFORMAT_ABGR8888;
++        renderer->info.texture_formats[2] = SDL_PIXELFORMAT_ABGR1555;
++    }
+     renderer->driverdata = data;
+     renderer->window = window;
+ 
+@@ -691,6 +906,8 @@
+         .texture_formats = {
+             [0] = SDL_PIXELFORMAT_ABGR1555,
+             [1] = SDL_PIXELFORMAT_ABGR8888,
++            /* + SDL_PIXELFORMAT_XBGR8888 (GS CT32, alpha ignored) with
++             * SDL_HINT_PS2_PREFER_XBGR8888, see PS2_CreateRenderer */
+         },
+         .max_texture_width = 1024,
+         .max_texture_height = 1024,
+diff -ruN a/src/video/ps2/SDL_ps2video.c b0001/src/video/ps2/SDL_ps2video.c
+--- a/src/video/ps2/SDL_ps2video.c	2025-01-01 16:47:53.000000000 +0100
++++ b0001/src/video/ps2/SDL_ps2video.c	2026-10-21 22:50:33.496909579 +0200
+@@ -58,14 +58,52 @@
+     SDL_free(device);
+ }
+ 
++typedef struct
++{
++    int pixel_w; /* 0: pixel size follows the window size */
++    int pixel_h;
++} PS2_WindowData;
++
+ static int PS2_CreateWindow(_THIS, SDL_Window *window)
+ {
++    PS2_WindowData *data = (PS2_WindowData *)SDL_calloc(1, sizeof(*data));
++    const char *hint = SDL_GetHint(SDL_HINT_PS2_WINDOW_PIXEL_SIZE);
++    int w, h;
++
++    if (!data) {
++        return SDL_OutOfMemory();
++    }
++    if (hint && SDL_sscanf(hint, "%dx%d", &w, &h) == 2 && w > 0 && h > 0 && w <= 1024 && h <= 1024) {
++        data->pixel_w = w;
++        data->pixel_h = h;
++    }
++    window->driverdata = data;
++
+     SDL_SetKeyboardFocus(window);
+ 
+     /* Window has been successfully created */
+     return 0;
+ }
+ 
++static void PS2_DestroyWindow(_THIS, SDL_Window *window)
++{
++    SDL_free(window->driverdata);
++    window->driverdata = NULL;
++}
++
++static void PS2_GetWindowSizeInPixels(_THIS, SDL_Window *window, int *w, int *h)
++{
++    PS2_WindowData *data = (PS2_WindowData *)window->driverdata;
++
++    if (data && data->pixel_w) {
++        *w = data->pixel_w;
++        *h = data->pixel_h;
++    } else {
++        *w = window->w;
++        *h = window->h;
++    }
++}
++
+ static int PS2_VideoInit(_THIS)
+ {
+     SDL_VideoDisplay display;
+@@ -117,6 +155,8 @@
+     device->VideoQuit = PS2_VideoQuit;
+     device->SetDisplayMode = PS2_SetDisplayMode;
+     device->CreateSDLWindow = PS2_CreateWindow;
++    device->DestroyWindow = PS2_DestroyWindow;
++    device->GetWindowSizeInPixels = PS2_GetWindowSizeInPixels;
+     device->PumpEvents = PS2_PumpEvents;
+     device->free = PS2_DeleteDevice;
+ 

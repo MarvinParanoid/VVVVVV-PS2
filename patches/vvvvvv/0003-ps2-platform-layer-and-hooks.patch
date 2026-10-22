@@ -1,0 +1,2617 @@
+--- a/desktop_version/src/PS2Platform.h
++++ b/desktop_version/src/PS2Platform.h
+@@ -0,0 +1,41 @@
++#ifndef PS2PLATFORM_H
++#define PS2PLATFORM_H
++
++/* PlayStation 2 platform layer: SDL configuration and instrumentation.
++ * Everything here is compiled only for the PS2 build (CMake adds
++ * PS2Platform.cpp when PS2 is set); call sites are guarded by __PS2__. */
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Before SDL_Init: SDL hints for the PS2 backend, log setup. */
++void PS2_PreInit(int argc, char *argv[]);
++/* After SDL_Init: thread priorities, controller report. */
++void PS2_PostInit(void);
++
++/* Main loop instrumentation (one deltaloop() per Begin/End pair). */
++void PS2_LoopBegin(void);
++void PS2_LoopEnd(void);
++void PS2_RenderBegin(void);
++void PS2_RenderEnd(void);
++
++/* Asset loading instrumentation (FILESYSTEM_loadAssetToMemory). */
++uint64_t PS2_NowUs(void);
++void PS2_LogAssetLoad(const char *name, size_t bytes, uint64_t us);
++
++void PS2_Log(const char *fmt, ...);
++/* Benchmark support: hold back log file writes while measuring; GS snapshot. */
++void PS2_LogDefer(int defer);
++void PS2_LogFlushNow(void); /* synchronous; for the fatal screen */
++int PS2_OnRealStorage(void); /* not PCSX2/ps2link host: */
++void PS2_Snapshot(const char *tag);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS2PLATFORM_H */
+--- a/desktop_version/src/PS2Platform.cpp
++++ b/desktop_version/src/PS2Platform.cpp
+@@ -0,0 +1,640 @@
++#include "PS2Platform.h"
++
++#include <SDL.h>
++#include <fcntl.h>
++#include <malloc.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <kernel.h>
++#include <timer.h>
++#include <dmaKit.h>
++#include <gsKit.h>
++#include <screenshot.h>
++
++#include "Game.h"
++#include "Map.h"
++#include "Music.h"
++#include "PS2Bench.h"
++#include "PS2Diag.h"
++
++/* Log file next to the ELF. The whole buffer is rewritten (O_TRUNC) when
++ * flushed: append/seek on host: and some devices is unreliable, and logs are
++ * small. Flushed on notable events and at most every 2 s otherwise. */
++#define PS2_LOG_SIZE (96 * 1024)
++static char log_buf[PS2_LOG_SIZE];
++static size_t log_len;
++static uint64_t log_last_flush;
++static int log_deferred; /* no file writes while a benchmark is measuring */
++/* Running from real storage (mass:, mc:, hdd...) rather than PCSX2/ps2link
++ * host:. There a 96 KB rewrite takes a noticeable time (USB 1.1), so the log
++ * is written by a background thread, at most every 10 s or on milestones,
++ * and periodic GS snapshots (900 KB each) are off unless snapshots.txt
++ * exists. See docs/ps2-p3-report.md, hardware readiness. */
++static bool on_real_storage;
++static bool snapshots_enabled = true;
++static bool crash_test;
++static uint32_t render_since_loop; /* render time inside the current loop */
++static char log_copy[PS2_LOG_SIZE];
++static size_t log_copy_len;
++static int log_writer_sema = -1;
++static volatile bool log_writer_busy;
++static int log_writer_tid = -1;
++static const char *const log_path = "vvvvvv_ps2.log";
++
++/* Frame statistics, reported every PS2_REPORT_FRAMES loop iterations. */
++#define PS2_REPORT_FRAMES 300
++static uint64_t loop_t0, loop_prev_start, render_t0;
++static uint32_t n_loops, n_renders;
++static uint64_t sum_period, sum_work, sum_render;
++static uint32_t max_period, max_work, max_render;
++static uint32_t render_samples[PS2_REPORT_FRAMES];
++static int last_gamestate = -1, last_rx = -1, last_ry = -1;
++static uint64_t first_present_us;
++static bool soak_enabled; /* music soak test, see music_soak_step() */
++static uint64_t boot_us;
++
++uint64_t PS2_NowUs(void)
++{
++    /* BUSCLK ticks -> microseconds; kBUSCLK = 147456000 */
++    return GetTimerSystemTime() * 1000ULL / (kBUSCLK / 1000ULL);
++}
++
++static void log_write_file(const char *buf, size_t len)
++{
++    int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if (fd >= 0)
++    {
++        write(fd, buf, len);
++        close(fd);
++    }
++}
++
++static void log_writer_thread(void *arg)
++{
++    (void) arg;
++    for (;;)
++    {
++        WaitSema(log_writer_sema);
++        log_write_file(log_copy, log_copy_len);
++        log_writer_busy = false;
++    }
++}
++
++static void log_flush(void)
++{
++    log_last_flush = PS2_NowUs();
++    if (log_writer_tid >= 0)
++    {
++        if (log_writer_busy)
++            return; /* the next flush writes the newer buffer */
++        memcpy(log_copy, log_buf, log_len);
++        log_copy_len = log_len;
++        log_writer_busy = true;
++        SignalSema(log_writer_sema);
++        return;
++    }
++    log_write_file(log_buf, log_len);
++}
++
++static void start_log_writer(void)
++{
++    static uint8_t stack[16 * 1024] __attribute__((aligned(16)));
++    ee_sema_t sema;
++    ee_thread_t thread;
++    sema.init_count = 0;
++    sema.max_count = 1;
++    sema.option = 0;
++    log_writer_sema = CreateSema(&sema);
++    if (log_writer_sema < 0)
++        return;
++    memset(&thread, 0, sizeof(thread));
++    thread.func = (void *) log_writer_thread;
++    thread.stack = stack;
++    thread.stack_size = sizeof(stack);
++    thread.gp_reg = &_gp;
++    thread.initial_priority = 50; /* above the game thread; it mostly waits on the IOP */
++    log_writer_tid = CreateThread(&thread);
++    if (log_writer_tid >= 0)
++        StartThread(log_writer_tid, NULL);
++}
++
++/* PS2_Log is used from several threads (game, music streaming via vlog_*),
++ * so appending to log_buf is serialised. The semaphore is created by the
++ * first call, which happens before any other thread exists. */
++static int log_lock = -1;
++
++static void log_lock_take(void)
++{
++    if (log_lock < 0)
++    {
++        ee_sema_t sema;
++        sema.init_count = 1;
++        sema.max_count = 1;
++        sema.option = 0;
++        log_lock = CreateSema(&sema);
++    }
++    if (log_lock >= 0)
++        WaitSema(log_lock);
++}
++
++static void log_lock_give(void)
++{
++    if (log_lock >= 0)
++        SignalSema(log_lock);
++}
++
++static void log_vline(const char *fmt, va_list ap, int flush)
++{
++    char line[512];
++    int n = SDL_vsnprintf(line, sizeof(line) - 1, fmt, ap);
++    if (n < 0)
++        return;
++    if (n > (int) sizeof(line) - 2)
++        n = (int) sizeof(line) - 2;
++    line[n++] = '\n';
++    line[n] = '\0';
++    printf("[ps2] %s", line);
++    log_lock_take();
++    if (log_len + n > PS2_LOG_SIZE)
++    {
++        /* keep the head (boot info) and the newest tail */
++        size_t keep_head = PS2_LOG_SIZE / 4;
++        size_t drop = log_len + n - PS2_LOG_SIZE + 4096;
++        memmove(log_buf + keep_head, log_buf + keep_head + drop, log_len - keep_head - drop);
++        log_len -= drop;
++    }
++    memcpy(log_buf + log_len, line, n);
++    log_len += n;
++    if (!log_deferred && (flush || PS2_NowUs() - log_last_flush > (on_real_storage ? 10000000u : 2000000u)))
++        log_flush();
++    log_lock_give();
++}
++
++void PS2_Log(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    log_vline(fmt, ap, 0);
++    va_end(ap);
++}
++
++int PS2_OnRealStorage(void)
++{
++    return on_real_storage;
++}
++
++void PS2_LogFlushNow(void)
++{
++    if (log_writer_tid >= 0)
++    {
++        while (log_writer_busy)
++            SDL_Delay(1);
++    }
++    log_lock_take();
++    log_write_file(log_buf, log_len);
++    log_lock_give();
++}
++
++void PS2_LogDefer(int defer)
++{
++    log_lock_take();
++    log_deferred = defer;
++    if (!defer)
++        log_flush();
++    log_lock_give();
++}
++
++static void PS2_LogNow(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    log_vline(fmt, ap, 1);
++    va_end(ap);
++}
++
++extern char end[];
++extern void *_gp;
++
++/* ---- GS framebuffer snapshots (evidence of what is on screen) ----
++ * Reads GS buffer 0 (640x448 CT24, allocated first by SDL's gsKit renderer)
++ * and writes a binary PPM next to the ELF. Same method as the P1 tests
++ * (tests/ps2/common/gsread.c), including re-arming GS FINISH afterwards. */
++#define GS_W 640
++#define GS_H 448
++static int snapshot_count;
++
++static void rearm_gs_finish(void)
++{
++    static u64 packet[4] __attribute__((aligned(16)));
++    packet[0] = GIF_TAG(1, 1, 0, 0, 0, 1);
++    packet[1] = GIF_AD;
++    packet[2] = 0;
++    packet[3] = GS_FINISH;
++    FlushCache(0);
++    dmaKit_send(DMA_CHANNEL_GIF, packet, 2);
++    dmaKit_wait_fast();
++    while (!(GS_CSR_FINISH))
++        ;
++}
++
++static void snapshot(const char *tag)
++{
++    char name[64], header[32];
++    uint8_t *buf = (uint8_t *) memalign(64, GS_W * GS_H * 3);
++    uint64_t t0 = PS2_NowUs();
++    int fd, hl;
++    if (!buf)
++        return;
++    if (ps2_screenshot(buf, 0, 0, 0, GS_W, GS_H, 1 /* CT24 */) != 1)
++    {
++        free(buf);
++        return;
++    }
++    FlushCache(0);
++    rearm_gs_finish();
++    SDL_snprintf(name, sizeof(name), "shot_%02d_%s.ppm", snapshot_count++, tag);
++    hl = SDL_snprintf(header, sizeof(header), "P6\n%d %d\n255\n", GS_W, GS_H);
++    fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if (fd >= 0)
++    {
++        write(fd, header, hl);
++        write(fd, buf, GS_W * GS_H * 3);
++        close(fd);
++    }
++    free(buf);
++    PS2_Log("SNAPSHOT %s (%lu us)", name, (unsigned long) (PS2_NowUs() - t0));
++}
++void PS2_Snapshot(const char *tag)
++{
++    if (snapshots_enabled)
++        snapshot(tag);
++}
++
++static uint32_t snapshot_due_loop;
++static const char *snapshot_due_tag;
++
++static void log_memory(const char *label)
++{
++    struct mallinfo mi = mallinfo();
++    char *brk = (char *) sbrk(0);
++    char *heap_end = (char *) EndOfHeap();
++    PS2_LogNow("MEM %-20s malloc_in_use=%lu arena=%lu headroom=%lu (EndOfHeap-brk %lu + free %lu) elf_end=%p",
++               label, (unsigned long) mi.uordblks, (unsigned long) mi.arena,
++               (unsigned long) (heap_end - brk) + (unsigned long) mi.fordblks,
++               (unsigned long) (heap_end - brk), (unsigned long) mi.fordblks, (void *) end);
++}
++
++void PS2_PreInit(int argc, char *argv[])
++{
++    char cwd[256];
++    boot_us = PS2_NowUs();
++    PS2Diag_Init();
++    if (!getcwd(cwd, sizeof(cwd)))
++        strcpy(cwd, "?");
++    on_real_storage = strncmp(cwd, "host", 4) != 0;
++    {
++        /* storage_real.txt: behave as on USB/MC/HDD (test the path in PCSX2) */
++        int fd = open("storage_real.txt", O_RDONLY);
++        if (fd >= 0)
++        {
++            close(fd);
++            on_real_storage = true;
++        }
++    }
++    if (on_real_storage)
++    {
++        int fd = open("snapshots.txt", O_RDONLY);
++        snapshots_enabled = fd >= 0;
++        if (fd >= 0)
++            close(fd);
++        start_log_writer();
++    }
++    PS2_LogNow("=== VVVVVV PS2, build %s ===", PS2Diag_BuildId());
++    PS2_LogNow("argv0=%s cwd=%s storage=%s log=%s snapshots=%s", argc > 0 ? argv[0] : "(none)", cwd,
++               on_real_storage ? "real (USB/MC/HDD)" : "host", log_writer_tid >= 0 ? "async, 10 s" : "sync, 2 s",
++               snapshots_enabled ? "on" : "off (create snapshots.txt to enable)");
++    log_memory("boot");
++
++    /* Option A render path (docs/ps2-p1-report.md, ps2-p1c-render-profile.md):
++     * SDL software renderer for render targets, 320x240 32-bit texture
++     * framebuffer scaled by the GS, small gsKit queues, batching and the
++     * bit-exact software blit fast paths. */
++    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
++    SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
++    SDL_SetHint("SDL_SW_BLIT_FASTPATHS", "1");
++    SDL_SetHint(SDL_HINT_PS2_DYNAMIC_VSYNC, "1");
++    SDL_SetHint("SDL_PS2_WINDOW_PIXEL_SIZE", "320x240");
++    SDL_SetHint("SDL_PS2_PREFER_XBGR8888", "1");
++    SDL_SetHint("SDL_PS2_RENDER_QUEUE_SIZE", "65536");
++    SDL_SetHint("SDL_PS2_RENDER_PERSISTENT_QUEUE_SIZE", "16384");
++    /* FAudio mixes (and would decode music) on the SDL audio thread */
++    SDL_SetHint(SDL_HINT_THREAD_STACK_SIZE, "131072");
++    /* Existing upstream console switches (no game-code changes needed):
++     * SteamDeck -> no keyboard (hides the level editor and text entry),
++     * SteamTenfoot -> forced fullscreen. */
++    SDL_SetHint("SteamDeck", "1");
++    SDL_SetHint("SteamTenfoot", "1");
++    PS2Bench_Init();
++    PS2Diag_Stage("boot device %s, %s storage", cwd, on_real_storage ? "real" : "host");
++    {
++        /* overlay.txt: start with the diagnostics overlay on (L3+R3 toggles it) */
++        int fd = open("overlay.txt", O_RDONLY);
++        if (fd >= 0)
++        {
++            close(fd);
++            PS2Diag_SetOverlay(1);
++        }
++        /* crashtest.txt: TEST ONLY - a trap exception after ~20 s of frames
++         * to check that the exception screen appears (a trap rather than an
++         * unaligned access: PCSX2 does not raise address errors) */
++        fd = open("crashtest.txt", O_RDONLY);
++        if (fd >= 0)
++        {
++            close(fd);
++            crash_test = true;
++            PS2_LogNow("crashtest.txt present: a deliberate CPU exception will follow");
++        }
++    }
++    /* P3 optimisations; all on unless bench.txt says opts=... (A/B runs) */
++    SDL_SetHint("SDL_PS2_P3_FASTPATHS", (ps2_opts & PS2_OPT_SDL_FASTPATHS) ? "1" : "0");
++#ifdef VVV_MUSIC_STREAMING
++    {
++        int fd = open("music_soak.txt", O_RDONLY);
++        if (fd >= 0)
++        {
++            close(fd);
++            soak_enabled = true;
++            PS2_LogNow("music soak test enabled (music_soak.txt present)");
++        }
++    }
++#endif
++}
++
++/* SDL_assert in the game: log it, show it as the last error, carry on (the
++ * default handler has no UI on the PS2 and would end the program). */
++static SDL_AssertState SDLCALL assertion_handler(const SDL_AssertData *data, void *userdata)
++{
++    char text[160];
++    (void) userdata;
++    SDL_snprintf(text, sizeof(text), "assertion '%s' failed at %s:%d", data->condition, data->filename, data->linenum);
++    PS2Diag_Message('E', text);
++    return SDL_ASSERTION_IGNORE;
++}
++
++void PS2_PostInit(void)
++{
++    int i, pads = 0;
++    SDL_SetAssertionHandler(assertion_handler, NULL);
++    /* Audio thread (SDL priority 15/16) must be able to preempt the main
++     * loop, or audio starves whenever a frame does not block (P1 W2). */
++    ChangeThreadPriority(GetThreadId(), 64);
++    for (i = 0; i < SDL_NumJoysticks(); i++)
++        pads += SDL_IsGameController(i) ? 1 : 0;
++    PS2_LogNow("SDL %d.%d.%d video=%s audio=%s joysticks=%d gamecontrollers=%d",
++               SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL,
++               SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "-",
++               SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "-",
++               SDL_NumJoysticks(), pads);
++#ifdef VVV_PS2_NO_MUSIC
++    PS2_LogNow("music: disabled at build time (VVV_PS2_NO_MUSIC); sound effects enabled");
++#endif
++    log_memory("after SDL_Init");
++    PS2Diag_Stage("SDL started: video %s, audio %s, %d controller(s)",
++                  SDL_WasInit(SDL_INIT_VIDEO) ? (SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?") : "FAILED",
++                  SDL_WasInit(SDL_INIT_AUDIO) ? (SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?") : "FAILED",
++                  pads);
++    if (!SDL_WasInit(SDL_INIT_VIDEO) || !SDL_WasInit(SDL_INIT_AUDIO))
++        PS2Diag_Message('E', SDL_GetError());
++}
++
++void PS2_LogAssetLoad(const char *name, size_t bytes, uint64_t us)
++{
++    PS2_Log("ASSET %-40s %8lu B %7lu us", name, (unsigned long) bytes, (unsigned long) us);
++}
++
++void PS2_RenderBegin(void)
++{
++    render_t0 = PS2_NowUs();
++    PS2Bench_RenderBegin();
++}
++
++void PS2_RenderEnd(void)
++{
++    uint32_t dt = (uint32_t) (PS2_NowUs() - render_t0);
++    if (n_renders < PS2_REPORT_FRAMES)
++        render_samples[n_renders] = dt;
++    n_renders++;
++    sum_render += dt;
++    if (dt > max_render)
++        max_render = dt;
++    render_since_loop += dt;
++    PS2Bench_RenderEnd();
++    if (!first_present_us)
++    {
++        first_present_us = PS2_NowUs();
++        PS2_LogNow("MILESTONE first frame presented at %.2f s after boot (render %lu us)",
++                   (first_present_us - boot_us) / 1e6, (unsigned long) dt);
++        log_memory("first frame");
++        snapshot_due_loop = n_loops + 60;
++        snapshot_due_tag = "boot";
++    }
++}
++
++#ifdef VVV_MUSIC_STREAMING
++/* ---- Music soak test (enabled only if music_soak.txt is next to the ELF) ----
++ * Drives the real music API (play() with its fade-in, pause/resume, sound
++ * effects on top; niceplay() is not used because it only takes effect once
++ * the game has started music, i.e. never on the title screen) on a fixed schedule, starting once
++ * GAMEMODE is reached (or after 60 s), so long PCSX2 runs exercise every
++ * track, track switches, loop boundaries and SFX mixing deterministically. */
++static uint64_t soak_t0;
++static int soak_last_song = -2, soak_last_sfx = -1, soak_paused_at = -1, soak_resumed_at = -1;
++
++static void music_soak_step(void)
++{
++    const uint64_t now = PS2_NowUs();
++    double t;
++    int song, sfx_slot, minute;
++
++    if (!soak_enabled)
++        return;
++    if (soak_t0 == 0)
++    {
++        if (game.gamestate != GAMEMODE && now - boot_us < 60000000ULL)
++            return;
++        soak_t0 = now;
++        PS2_LogNow("SOAK start (gamestate=%d): 16 songs x 20 s, then song 10 (6:09) for 420 s, then song 1 (3:39) "
++                   "for 240 s; pause/resume every 60 s; an SFX every 5 s", game.gamestate);
++    }
++    t = (now - soak_t0) / 1e6;
++    if (t < 320.0)
++        song = (int) (t / 20.0);           /* every song incl. the non-looping jingles 0 and 7 */
++    else if (t < 740.0)
++        song = 10;                          /* longest track: reaches its loop point at 369 s */
++    else if (t < 980.0)
++        song = 1;
++    else
++        song = 4;
++    if (song != soak_last_song && song != music.currentsong)
++    {
++        PS2_Log("SOAK t=%.1f s play(%d) (was %d)", t, song, music.currentsong);
++        music.play(song);
++    }
++    soak_last_song = song;
++
++    /* pause for 3 s at the start of every minute (after the first) */
++    minute = (int) (t / 60.0);
++    if (minute > 0 && soak_paused_at != minute && t - minute * 60.0 < 1.0)
++    {
++        soak_paused_at = minute;
++        PS2_Log("SOAK t=%.1f s pause", t);
++        music.pause();
++    }
++    if (soak_paused_at == minute && soak_resumed_at != minute && t - minute * 60.0 >= 3.0)
++    {
++        soak_resumed_at = minute;
++        PS2_Log("SOAK t=%.1f s resume", t);
++        music.resume();
++    }
++
++    sfx_slot = (int) (t / 5.0);
++    if (sfx_slot != soak_last_sfx)
++    {
++        soak_last_sfx = sfx_slot;
++        music.playef(sfx_slot % 28);
++    }
++}
++#endif
++
++void PS2_LoopBegin(void)
++{
++    uint64_t now = PS2_NowUs();
++    while (PS2Diag_Halted())
++    {
++        /* an exception/fatal screen is up (possibly reported from another
++         * thread): stop rendering so it stays visible */
++        SleepThread();
++    }
++    if (loop_prev_start)
++    {
++        uint32_t period = (uint32_t) (now - loop_prev_start);
++        PS2Diag_Frame(period, render_since_loop);
++        sum_period += period;
++        if (period > max_period)
++            max_period = period;
++    }
++    loop_prev_start = now;
++    loop_t0 = now;
++    render_since_loop = 0;
++    PS2Bench_LoopBegin(now);
++}
++
++static int cmp_u32(const void *a, const void *b)
++{
++    uint32_t x = *(const uint32_t *) a, y = *(const uint32_t *) b;
++    return (x > y) - (x < y);
++}
++
++void PS2_LoopEnd(void)
++{
++    uint32_t work = (uint32_t) (PS2_NowUs() - loop_t0);
++    sum_work += work;
++    if (work > max_work)
++        max_work = work;
++    n_loops++;
++    if (crash_test && n_loops == 600)
++    {
++        PS2_LogFlushNow();
++        __asm__ volatile("teq $0, $0"); /* trap exception (code 13) */
++    }
++#ifdef VVV_MUSIC_STREAMING
++    music_soak_step();
++#endif
++    PS2Bench_LoopEnd();
++
++#ifdef VVV_MUSIC_STREAMING
++    {
++        static Uint32 seen_opens;
++        StreamStats ms;
++        MUSIC_GetStreamStats(&ms);
++        if (ms.opens != seen_opens)
++        {
++            seen_opens = ms.opens;
++            PS2_Log("MUSIC opened source %d for song %d in %lu us (t=%.2f s) underruns so far %lu",
++                    ms.last_source, music.currentsong, (unsigned long) ms.last_open_us,
++                    (PS2_NowUs() - boot_us) / 1e6, (unsigned long) ms.underruns);
++        }
++    }
++#endif
++
++    /* gamestate / room transitions: evidence of reaching playable rooms */
++    if (game.gamestate != last_gamestate || game.roomx != last_rx || game.roomy != last_ry)
++    {
++        PS2_Log("STATE gamestate=%d room=(%d,%d) t=%.2f s", game.gamestate, game.roomx, game.roomy,
++                (PS2_NowUs() - boot_us) / 1e6);
++        if (game.gamestate == GAMEMODE && last_gamestate != GAMEMODE && !PS2Bench_Active())
++        {
++            log_memory("entered GAMEMODE");
++            snapshot_due_loop = n_loops + 90;
++            snapshot_due_tag = "gamemode";
++        }
++        last_gamestate = game.gamestate;
++        last_rx = game.roomx;
++        last_ry = game.roomy;
++    }
++
++    if (snapshot_due_tag && n_loops >= snapshot_due_loop)
++    {
++        PS2_Snapshot(snapshot_due_tag);
++        snapshot_due_tag = NULL;
++    }
++    else if (n_loops % 1800 == 0 && !PS2Bench_Active())
++    {
++        PS2_Snapshot("periodic");
++    }
++
++    if (n_loops % PS2_REPORT_FRAMES == 0)
++    {
++        uint32_t p95 = 0, p50 = 0;
++        int n = n_renders < PS2_REPORT_FRAMES ? (int) n_renders : PS2_REPORT_FRAMES;
++        if (n > 0)
++        {
++            qsort(render_samples, n, sizeof(uint32_t), cmp_u32);
++            p50 = render_samples[n / 2];
++            p95 = render_samples[(n * 95) / 100];
++        }
++        PS2_Log("FRAME loops=%d period mean=%lu max=%lu us | work(logic+render) mean=%lu max=%lu us | "
++                "render mean=%lu p50=%lu p95=%lu max=%lu us (%d renders) | gamestate=%d room=(%d,%d)",
++                PS2_REPORT_FRAMES,
++                (unsigned long) (sum_period / PS2_REPORT_FRAMES), (unsigned long) max_period,
++                (unsigned long) (sum_work / PS2_REPORT_FRAMES), (unsigned long) max_work,
++                (unsigned long) (n ? sum_render / n_renders : 0), (unsigned long) p50, (unsigned long) p95,
++                (unsigned long) max_render, (int) n_renders, game.gamestate, game.roomx, game.roomy);
++        log_memory("periodic");
++#ifdef VVV_MUSIC_STREAMING
++        {
++            StreamStats ms;
++            MUSIC_GetStreamStats(&ms);
++            PS2_Log("MUSIC active=%d song=%d opens=%lu (fail %lu) open last=%lu max=%lu us | decode calls=%lu "
++                    "avg=%lu max=%lu us | underruns=%lu (%lu frames) priming=%lu yields=%lu max slice=%lu us (phase %d) | ring %lu B, "
++                    "fill now=%lu min=%lu frames | loops=%lu loop seek max=%lu us fill at loop=%lu",
++                    (int) ms.active, music.currentsong, (unsigned long) ms.opens, (unsigned long) ms.open_failures,
++                    (unsigned long) ms.last_open_us, (unsigned long) ms.max_open_us, (unsigned long) ms.decode_calls,
++                    (unsigned long) (ms.decode_calls ? ms.decode_us_total / ms.decode_calls : 0),
++                    (unsigned long) ms.max_decode_us, (unsigned long) ms.underruns,
++                    (unsigned long) ms.underrun_frames, (unsigned long) ms.priming_buffers,
++                    (unsigned long) ms.yields, (unsigned long) ms.max_slice_us, ms.max_slice_phase, (unsigned long) ms.ring_bytes, (unsigned long) ms.ring_fill_frames,
++                    (unsigned long) ms.min_fill_frames, (unsigned long) ms.loops,
++                    (unsigned long) ms.max_loop_seek_us, (unsigned long) ms.loop_fill_frames);
++            MUSIC_ResetStreamMinFill();
++        }
++#endif
++        sum_period = sum_work = sum_render = 0;
++        max_period = max_work = max_render = 0;
++        n_renders = 0;
++    }
++}
+--- a/desktop_version/src/PS2Bench.h
++++ b/desktop_version/src/PS2Bench.h
+@@ -0,0 +1,44 @@
++#ifndef PS2BENCH_H
++#define PS2BENCH_H
++
++/* PS2 scene benchmark (PS2 build only, enabled by a bench.txt next to the
++ * ELF). Drives the game into fixed scenes with its own entry points
++ * (startgamemode, gotoroom, map menu), records per-frame timings split into
++ * logic / game draw calls / SDL software rasterisation / GS upload / vsync,
++ * samples the EE program counter for a profile, and checks optimisations
++ * with an A/B render of one frozen game state (docs/ps2-p3-report.md). */
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Runtime switches for the P3 rendering optimisations (bitmask). The A/B
++ * pixel check renders the same frozen frame with 0 and with the enabled set. */
++#define PS2_OPT_TARGET_ABGR 0x1u    /* render targets in the textures' ABGR8888 layout */
++#define PS2_OPT_SDL_FASTPATHS 0x2u  /* SDL_PS2_P3_FASTPATHS (SDL patches 0004-0006) */
++#define PS2_OPT_WINDOW_CLEARS 0x4u  /* skip window clears that render() overwrites anyway */
++#define PS2_OPT_OPAQUE_SCROLL 0x8u  /* scroll_texture() copies without blending */
++#define PS2_OPT_ALL 0xffffffffu
++extern uint32_t ps2_opts;
++/* diagnostics counted by game code */
++extern uint32_t ps2_tower_full_redraws;
++
++void PS2Bench_Init(void);
++int PS2Bench_Active(void);
++void PS2Bench_LoopBegin(uint64_t now_us);
++void PS2Bench_LoopEnd(void);
++void PS2Bench_LogicBegin(void);
++void PS2Bench_LogicEnd(void);
++void PS2Bench_RenderBegin(void);
++void PS2Bench_RenderEnd(void);
++int PS2Bench_LogicFrozen(void);
++int PS2Bench_WantsVerify(void);
++void PS2Bench_Verify(void (*render)(void));
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS2BENCH_H */
+--- a/desktop_version/src/PS2Bench.cpp
++++ b/desktop_version/src/PS2Bench.cpp
+@@ -0,0 +1,898 @@
++#include "PS2Bench.h"
++
++#include <SDL.h>
++#include <fcntl.h>
++#include <malloc.h>
++#include <stdlib.h>
++#include <stdarg.h>
++#include <string.h>
++#include <sys/reent.h>
++#include <unistd.h>
++
++#include <kernel.h>
++#include <timer.h>
++#include <timer_alarm.h>
++
++#include "Entity.h"
++#include "Game.h"
++#include "Graphics.h"
++#include "Map.h"
++#include "Music.h"
++#include "PS2Diag.h"
++#include "PS2Platform.h"
++#include "Screen.h"
++#include "Script.h"
++#include "UtilityClass.h"
++
++uint32_t ps2_opts = PS2_OPT_ALL;
++uint32_t ps2_tower_full_redraws;
++static uint32_t tower_redraws0;
++
++/* Diagnostics exported by this repo's SDL patches (0001 GS backend, 0003
++ * software renderer); layouts must match the definitions there. */
++extern "C" {
++typedef struct
++{
++    uint64_t presents, update_us, queue_build_us, exec_us, finish_us, vsync_us;
++    uint32_t os_queue_size, per_queue_size, os_queue_peak, per_queue_peak, early_flushes, oversize_drops;
++} PS2_RenderStats;
++extern PS2_RenderStats PS2_render_stats;
++
++typedef struct
++{
++    uint64_t runs, queue_us, cmds[16];
++    uint64_t dead_clears;
++    struct
++    {
++        uint32_t src_format, dst_format, blend, mod;
++        uint64_t count, pixels;
++    } kinds[24];
++} SW_RenderStats;
++extern SW_RenderStats SW_render_stats;
++extern int SW_render_stats_kinds;
++}
++
++/* SDL_RenderCommandType values (SDL_sysrender.h) */
++enum
++{
++    CMD_SETVIEWPORT = 1, CMD_SETCLIPRECT, CMD_SETDRAWCOLOR, CMD_CLEAR, CMD_DRAW_POINTS,
++    CMD_DRAW_LINES, CMD_FILL_RECTS, CMD_COPY, CMD_COPY_EX, CMD_GEOMETRY
++};
++
++/* ---- configuration (bench.txt: key=value lines) ---- */
++static int enabled;
++static int cfg_settle_s = 4, cfg_measure_s = 20, cfg_over30 = -1, cfg_profile = 1, cfg_verify = 1, cfg_golden_ticks = 90;
++static int cfg_overlay;
++/* compact per-scene summary, written once as bench_results.txt at the end */
++static char results[4096];
++static size_t results_len;
++
++static void result_line(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    const int n = SDL_vsnprintf(results + results_len, sizeof(results) - results_len, fmt, ap);
++    va_end(ap);
++    if (n > 0 && results_len + n < sizeof(results))
++    {
++        results_len += n;
++    }
++}
++static char cfg_scenes[256];
++
++/* ---- per-frame records ---- */
++struct Frame
++{
++    uint32_t period_us, logic_us, ticks, render_us;
++    uint32_t sw_us, gs_upload_us, gs_dma_us, vsync_us;
++    uint32_t copies, fills, cmds, decode_us;
++};
++#define MAX_FRAMES 4000
++static Frame* frames;
++static int n_frames;
++static Frame cur;
++static uint64_t loop_start_us, logic_t0, render_t0;
++static PS2_RenderStats gs0;
++static SW_RenderStats sw0, sw_scene0;
++#ifdef VVV_MUSIC_STREAMING
++static uint64_t decode_total0;
++static uint32_t underruns0;
++#endif
++
++/* ---- sampling profiler: EE timer counter alarm, records the interrupted PC ---- */
++#define PROF_HZ 1009 /* prime, so it does not lock to the 60 Hz frame */
++#define PROF_CAP 40000
++static uint32_t* prof_buf;
++static volatile uint32_t prof_n;
++static volatile int prof_on;
++static s32 prof_id = -1;
++static u64 prof_period;
++static volatile uint32_t prof_calls;
++
++static u64 prof_handler(s32 id, u64 scheduled_time, u64 actual_time, void* arg, void* pc_value)
++{
++    (void) id;
++    (void) scheduled_time;
++    (void) actual_time;
++    (void) arg;
++    prof_calls++;
++    if (prof_on && prof_n < PROF_CAP)
++    {
++        prof_buf[prof_n++] = (uint32_t) (uintptr_t) pc_value;
++    }
++    /* one-shot alarm: re-arm for the next sample */
++    iSetTimerAlarm(prof_period, prof_handler, NULL);
++    return 0;
++}
++
++static void prof_start(void)
++{
++    if (prof_id >= 0)
++    {
++        return;
++    }
++    prof_buf = (uint32_t*) malloc(sizeof(uint32_t) * PROF_CAP);
++    prof_period = kBUSCLK / PROF_HZ;
++    prof_id = prof_buf != NULL ? SetTimerAlarm(prof_period, prof_handler, NULL) : -1;
++    if (prof_id < 0)
++    {
++        PS2_Log("BENCH profiler unavailable (alarm %d)", (int) prof_id);
++        return;
++    }
++}
++
++/* ---- scenes ---- */
++static void place_player(int x, int y)
++{
++    const int i = obj.getplayer();
++    if (INBOUNDS_VEC(i, obj.entities))
++    {
++        obj.entities[i].xp = x;
++        obj.entities[i].yp = y;
++        obj.entities[i].lerpoldxp = x;
++        obj.entities[i].lerpoldyp = y;
++    }
++}
++
++static void s_title(void)
++{
++    if (game.gamestate != TITLEMODE)
++    {
++        game.quittomenu();
++    }
++}
++static void s_intro(void) { script.startgamemode(Start_MAINGAME); }
++static void s_ss1(void) { script.startgamemode(Start_TIMETRIAL_SPACESTATION1); }
++static void s_lab(void) { script.startgamemode(Start_TIMETRIAL_LABORATORY); }
++static void s_warp(void) { script.startgamemode(Start_TIMETRIAL_WARPZONE); }
++static void s_map(void) { game.mapmenuchange(MAPMODE, true); }
++static void s_tower(void)
++{
++    script.startgamemode(Start_TIMETRIAL_TOWER);
++    map.invincibility = true;
++    place_player(150, 193);
++    map.gotoroom(109, 109);
++}
++/* Typical tower play: the camera scrolls on its own and a player who climbs
++ * stays on screen, so only new rows of the background are drawn. An idle
++ * player falls behind the camera instead, which makes the game redraw the
++ * whole background every tick (the "tower"/"panic_room" worst cases, also
++ * what happens while falling or respawning). */
++static bool ride_camera;
++static void s_tower_climb(void)
++{
++    s_tower();
++    ride_camera = true;
++}
++static void s_panic(void)
++{
++    script.startgamemode(Start_TIMETRIAL_FINALLEVEL);
++    map.invincibility = true;
++    place_player(150, 40);
++    map.gotoroom(49, 52);
++}
++static void s_gravitron(void)
++{
++    map.invincibility = false; /* set by the tower scenes; the Gravitron refuses it */
++    script.startgamemode(Start_SECRETLAB);
++    map.gotoroom(119, 108);
++    place_player(148, 100);
++    game.setstate(9); /* what the Super Gravitron trigger does */
++}
++
++struct Scene
++{
++    const char* name;
++    void (*setup)(void);
++    int extra_settle_s;
++};
++static const Scene scenes[] = {
++    {"title", s_title, 0},
++    {"intro_dialogue", s_intro, 6},
++    {"room_ss1", s_ss1, 5},
++    {"map", s_map, 0},
++    {"room_lab", s_lab, 5},
++    {"warpzone", s_warp, 5},
++    {"tower", s_tower, 5},
++    {"tower_climb", s_tower_climb, 5},
++    {"panic_room", s_panic, 5},
++    {"super_gravitron", s_gravitron, 4},
++};
++#define NUM_SCENES ((int) SDL_arraysize(scenes))
++
++enum Phase
++{
++    P_BOOT, P_GOLDEN, P_GOLDEN_CAPTURE, P_SETTLE, P_MEASURE, P_FREEZE, P_VERIFY, P_SNAPSHOT, P_NEXT, P_DONE
++};
++static Phase phase = P_BOOT;
++static int scene = -1;
++static uint64_t phase_t0, measure_t0, measure_t1;
++static int phase_loops;
++static int frozen, want_verify, want_golden;
++/* pass 0: golden frames (driven only by logic tick counts, so the game state
++ * is the same in every build); pass 1: timed measurements */
++static int pass;
++
++static bool scene_selected(int i)
++{
++    if (cfg_scenes[0] == '\0')
++    {
++        return true;
++    }
++    /* whole comma-separated names only ("tower" must not match "tower_climb") */
++    const size_t n = strlen(scenes[i].name);
++    for (const char* p = strstr(cfg_scenes, scenes[i].name); p != NULL; p = strstr(p + 1, scenes[i].name))
++    {
++        if ((p == cfg_scenes || p[-1] == ',') && (p[n] == '\0' || p[n] == ',' || p[n] == '\n' || p[n] == '\r'))
++        {
++            return true;
++        }
++    }
++    return false;
++}
++
++void PS2Bench_Init(void)
++{
++    char buf[512];
++    int fd = open("bench.txt", O_RDONLY);
++    if (fd < 0)
++    {
++        return;
++    }
++    const int n = read(fd, buf, sizeof(buf) - 1);
++    close(fd);
++    buf[n > 0 ? n : 0] = '\0';
++    for (char* line = strtok(buf, "\r\n"); line != NULL; line = strtok(NULL, "\r\n"))
++    {
++        char* eq = strchr(line, '=');
++        if (eq == NULL)
++        {
++            continue;
++        }
++        *eq = '\0';
++        const char* v = eq + 1;
++        if (strcmp(line, "settle") == 0) cfg_settle_s = atoi(v);
++        else if (strcmp(line, "measure") == 0) cfg_measure_s = atoi(v);
++        else if (strcmp(line, "over30") == 0) cfg_over30 = atoi(v);
++        else if (strcmp(line, "profile") == 0) cfg_profile = atoi(v);
++        else if (strcmp(line, "verify") == 0) cfg_verify = atoi(v);
++        else if (strcmp(line, "golden") == 0) cfg_golden_ticks = atoi(v);
++        else if (strcmp(line, "kinds") == 0) SW_render_stats_kinds = atoi(v); /* copy kinds; costs ~2% */
++        else if (strcmp(line, "opts") == 0) ps2_opts = (uint32_t) strtoul(v, NULL, 0);
++        else if (strcmp(line, "scenes") == 0) SDL_strlcpy(cfg_scenes, v, sizeof(cfg_scenes));
++        else if (strcmp(line, "overlay") == 0) cfg_overlay = atoi(v);
++        else if (strcmp(line, "preset") == 0 && strcmp(v, "hardware") == 0)
++        {
++            /* the scenes asked for in H1, unchanged from P3 */
++            SDL_strlcpy(cfg_scenes, "intro_dialogue,room_ss1,tower_climb,tower,panic_room,super_gravitron", sizeof(cfg_scenes));
++        }
++    }
++    frames = (Frame*) malloc(sizeof(Frame) * MAX_FRAMES);
++    enabled = frames != NULL;
++    if (cfg_overlay)
++    {
++        PS2Diag_SetOverlay(1);
++    }
++    result_line("# VVVVVV PS2 benchmark: settle=%d s measure=%d s over30=%d opts=0x%lx overlay=%d\n"
++                "# times in ms; tps = logic ticks per second (full speed %.1f); tps_min = slowest 1 s window\n"
++                "# scene            tps   tps_min frame  p95    p99    max    render underruns mem_MiB\n",
++                cfg_settle_s, cfg_measure_s, cfg_over30, (unsigned long) ps2_opts, cfg_overlay, 1000.0 / 34);
++    PS2_Log("BENCH enabled: settle=%d measure=%d over30=%d profile=%d verify=%d opts=0x%lx scenes=%s",
++            cfg_settle_s, cfg_measure_s, cfg_over30, cfg_profile, cfg_verify, (unsigned long) ps2_opts,
++            cfg_scenes[0] ? cfg_scenes : "(all)");
++}
++
++int PS2Bench_Active(void)
++{
++    return enabled;
++}
++
++int PS2Bench_LogicFrozen(void)
++{
++    return frozen;
++}
++
++int PS2Bench_WantsVerify(void)
++{
++    return want_verify || want_golden;
++}
++
++void PS2Bench_LogicBegin(void)
++{
++    logic_t0 = PS2_NowUs();
++}
++
++static int ticks_since_setup;
++
++void PS2Bench_LogicEnd(void)
++{
++    PS2Diag_Tick();
++    cur.logic_us += (uint32_t) (PS2_NowUs() - logic_t0);
++    cur.ticks++;
++    ticks_since_setup++;
++}
++
++/* Rendering draws random numbers too (flicker colours, screen shake). In
++ * bench mode every render uses its own fixed sequence and leaves the logic's
++ * rand() state untouched, so the game state after N logic ticks does not
++ * depend on how many frames were rendered, and golden frames are comparable
++ * across builds. */
++static unsigned long long logic_rand_state;
++
++void PS2Bench_RenderBegin(void)
++{
++    if (enabled)
++    {
++        logic_rand_state = _REENT_RAND_NEXT(_REENT);
++        srand(4242);
++    }
++    render_t0 = PS2_NowUs();
++    gs0 = PS2_render_stats;
++    sw0 = SW_render_stats;
++}
++
++void PS2Bench_RenderEnd(void)
++{
++    if (enabled)
++    {
++        _REENT_RAND_NEXT(_REENT) = logic_rand_state;
++    }
++    const PS2_RenderStats& g = PS2_render_stats;
++    const SW_RenderStats& s = SW_render_stats;
++    cur.render_us = (uint32_t) (PS2_NowUs() - render_t0);
++    cur.sw_us = (uint32_t) (s.queue_us - sw0.queue_us);
++    cur.gs_upload_us = (uint32_t) ((g.update_us - gs0.update_us) + (g.queue_build_us - gs0.queue_build_us));
++    cur.gs_dma_us = (uint32_t) ((g.exec_us - gs0.exec_us) + (g.finish_us - gs0.finish_us));
++    cur.vsync_us = (uint32_t) (g.vsync_us - gs0.vsync_us);
++    cur.copies = (uint32_t) ((s.cmds[CMD_COPY] - sw0.cmds[CMD_COPY]) + (s.cmds[CMD_COPY_EX] - sw0.cmds[CMD_COPY_EX]));
++    cur.fills = (uint32_t) ((s.cmds[CMD_FILL_RECTS] - sw0.cmds[CMD_FILL_RECTS]) + (s.cmds[CMD_CLEAR] - sw0.cmds[CMD_CLEAR]));
++    cur.cmds = 0;
++    for (int i = 0; i < 16; i++)
++    {
++        cur.cmds += (uint32_t) (s.cmds[i] - sw0.cmds[i]);
++    }
++}
++
++void PS2Bench_LoopBegin(uint64_t now_us)
++{
++    if (!enabled)
++    {
++        return;
++    }
++    if (loop_start_us != 0 && phase == P_MEASURE && n_frames < MAX_FRAMES)
++    {
++        cur.period_us = (uint32_t) (now_us - loop_start_us);
++#ifdef VVV_MUSIC_STREAMING
++        StreamStats ms;
++        MUSIC_GetStreamStats(&ms);
++        cur.decode_us = (uint32_t) (ms.decode_us_total - decode_total0);
++        decode_total0 = ms.decode_us_total;
++#endif
++        frames[n_frames++] = cur;
++    }
++    loop_start_us = now_us;
++    SDL_zero(cur);
++}
++
++/* ---- reporting ---- */
++static int cmp_u32(const void* a, const void* b)
++{
++    const uint32_t x = *(const uint32_t*) a, y = *(const uint32_t*) b;
++    return (x > y) - (x < y);
++}
++
++struct Dist
++{
++    double mean;
++    uint32_t p50, p95, p99, max;
++};
++
++static Dist dist(uint32_t Frame::*field, bool renders_only)
++{
++    static uint32_t tmp[MAX_FRAMES];
++    Dist d;
++    SDL_zero(d);
++    int n = 0;
++    uint64_t sum = 0;
++    for (int i = 0; i < n_frames; i++)
++    {
++        if (renders_only && frames[i].render_us == 0)
++        {
++            continue;
++        }
++        tmp[n] = frames[i].*field;
++        sum += tmp[n++];
++    }
++    if (n == 0)
++    {
++        return d;
++    }
++    qsort(tmp, n, sizeof(uint32_t), cmp_u32);
++    d.mean = (double) sum / n;
++    d.p50 = tmp[n / 2];
++    d.p95 = tmp[(n * 95) / 100];
++    d.p99 = tmp[(n * 99) / 100];
++    d.max = tmp[n - 1];
++    return d;
++}
++
++static void write_csv(const char* name)
++{
++    char path[64];
++    SDL_snprintf(path, sizeof(path), "bench_%02d_%s.csv", scene, name);
++    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if (fd < 0)
++    {
++        return;
++    }
++    char line[160];
++    int len = SDL_snprintf(line, sizeof(line),
++                           "period_us,logic_us,ticks,render_us,sw_us,gs_upload_us,gs_dma_us,vsync_us,copies,fills,cmds,decode_us\n");
++    write(fd, line, len);
++    for (int i = 0; i < n_frames; i++)
++    {
++        const Frame& f = frames[i];
++        len = SDL_snprintf(line, sizeof(line), "%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
++                           (unsigned long) f.period_us, (unsigned long) f.logic_us, (unsigned long) f.ticks,
++                           (unsigned long) f.render_us, (unsigned long) f.sw_us, (unsigned long) f.gs_upload_us,
++                           (unsigned long) f.gs_dma_us, (unsigned long) f.vsync_us, (unsigned long) f.copies,
++                           (unsigned long) f.fills, (unsigned long) f.cmds, (unsigned long) f.decode_us);
++        write(fd, line, len);
++    }
++    close(fd);
++}
++
++static void write_profile(const char* name)
++{
++    if (prof_n == 0)
++    {
++        return;
++    }
++    char path[64];
++    SDL_snprintf(path, sizeof(path), "prof_%02d_%s.txt", scene, name);
++    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if (fd < 0)
++    {
++        return;
++    }
++    const uint32_t n = prof_n;
++    qsort(prof_buf, n, sizeof(uint32_t), cmp_u32);
++    char line[32];
++    for (uint32_t i = 0; i < n;)
++    {
++        uint32_t j = i;
++        while (j < n && prof_buf[j] == prof_buf[i])
++        {
++            j++;
++        }
++        const int len = SDL_snprintf(line, sizeof(line), "%08lx %lu\n", (unsigned long) prof_buf[i], (unsigned long) (j - i));
++        write(fd, line, len);
++        i = j;
++    }
++    close(fd);
++}
++
++static void report(void)
++{
++    const char* name = scenes[scene].name;
++    const double secs = (measure_t1 - measure_t0) / 1e6;
++    uint32_t renders = 0, ticks = 0, multi = 0;
++    uint64_t logic = 0, sw = 0, up = 0, dma = 0, vs = 0, copies = 0, fills = 0, cmds = 0, render = 0, decode = 0;
++    uint64_t idle = 0; /* loop period not spent in logic or rendering: sleeping, vsync wait, platform hooks */
++    for (int i = 0; i < n_frames; i++)
++    {
++        const Frame& f = frames[i];
++        ticks += f.ticks;
++        multi += f.ticks >= 2;
++        logic += f.logic_us;
++        decode += f.decode_us;
++        if (f.period_us > f.logic_us + f.render_us)
++        {
++            idle += f.period_us - f.logic_us - f.render_us;
++        }
++        if (f.render_us)
++        {
++            renders++;
++            render += f.render_us;
++            sw += f.sw_us;
++            up += f.gs_upload_us;
++            dma += f.gs_dma_us;
++            vs += f.vsync_us;
++            copies += f.copies;
++            fills += f.fills;
++            cmds += f.cmds;
++        }
++    }
++    const Dist period = dist(&Frame::period_us, false);
++    /* slowest one-second window: the game's speed when it dips */
++    double tps_min = 0.0;
++    {
++        uint64_t acc = 0;
++        uint32_t win_ticks = 0;
++        for (int i = 0; i < n_frames; i++)
++        {
++            acc += frames[i].period_us;
++            win_ticks += frames[i].ticks;
++            if (acc >= 1000000)
++            {
++                const double tps = win_ticks / (acc / 1e6);
++                if (tps_min == 0.0 || tps < tps_min)
++                {
++                    tps_min = tps;
++                }
++                acc = 0;
++                win_ticks = 0;
++            }
++        }
++    }
++    const Dist rend = dist(&Frame::render_us, true);
++    const double r = renders ? renders : 1;
++    /* game draw = everything in render() that is not SDL execution, GS or vsync:
++     * VVVVVV's draw code plus SDL's command queuing */
++    const double draw = (render - sw - up - dma - vs) / r;
++    struct mallinfo mi = mallinfo();
++    PS2_Log("BENCH scene=%s frames=%d renders=%lu secs=%.1f | logic %.1f ticks/s, render %.1f fps, "
++            "multi-tick loops %lu | period mean=%.2f p50=%.2f p95=%.2f p99=%.2f max=%.2f ms | "
++            "render mean=%.2f p50=%.2f p95=%.2f p99=%.2f max=%.2f ms | per render: logic-in-loop=%.2f "
++            "draw=%.2f sw=%.2f gs_upload=%.2f gs_dma=%.2f vsync=%.2f ms | logic per tick=%.2f ms | "
++            "cmds/render=%.0f copies=%.0f fills=%.0f | music decode %.1f ms/s | idle per loop %.2f ms | malloc_in_use=%lu",
++            name, n_frames, (unsigned long) renders, secs, ticks / secs, renders / secs, (unsigned long) multi,
++            period.mean / 1000, period.p50 / 1000.0, period.p95 / 1000.0, period.p99 / 1000.0, period.max / 1000.0,
++            rend.mean / 1000, rend.p50 / 1000.0, rend.p95 / 1000.0, rend.p99 / 1000.0, rend.max / 1000.0,
++            logic / r / 1000, draw / 1000, sw / r / 1000, up / r / 1000, dma / r / 1000, vs / r / 1000,
++            ticks ? logic / (double) ticks / 1000 : 0.0, cmds / r, copies / r, fills / r, decode / secs / 1000,
++            n_frames ? idle / (double) n_frames / 1000 : 0.0, (unsigned long) mi.uordblks);
++    long scene_underruns = -1; /* -1: build without music */
++#ifdef VVV_MUSIC_STREAMING
++    {
++        StreamStats ms;
++        MUSIC_GetStreamStats(&ms);
++        scene_underruns = (long) (ms.underruns - underruns0);
++        PS2_Log("BENCH scene=%s music: song=%d active=%d underruns during scene=%lu (total %lu) opens=%lu max slice=%lu us",
++                name, music.currentsong, (int) ms.active, (unsigned long) (ms.underruns - underruns0),
++                (unsigned long) ms.underruns, (unsigned long) ms.opens, (unsigned long) ms.max_slice_us);
++    }
++#endif
++    PS2_Log("BENCH scene=%s tps min over 1 s windows: %.1f", name, tps_min);
++    result_line("%-17s %5.1f %6.1f %6.2f %6.2f %6.2f %6.2f %6.2f %6ld %7.2f\n", name, ticks / secs, tps_min,
++                period.mean / 1000, period.p95 / 1000.0, period.p99 / 1000.0, period.max / 1000.0, rend.mean / 1000,
++                scene_underruns, mi.uordblks / 1048576.0);
++    {
++        /* copies by kind during the scene, largest pixel counts first */
++        int order[24], n = 0;
++        for (int i = 0; i < 24; i++)
++        {
++            if (SW_render_stats.kinds[i].count > sw_scene0.kinds[i].count)
++            {
++                order[n++] = i;
++            }
++        }
++        for (int a = 0; a < n; a++)
++        {
++            for (int b = a + 1; b < n; b++)
++            {
++                const uint64_t pa = SW_render_stats.kinds[order[a]].pixels - sw_scene0.kinds[order[a]].pixels;
++                const uint64_t pb = SW_render_stats.kinds[order[b]].pixels - sw_scene0.kinds[order[b]].pixels;
++                if (pb > pa)
++                {
++                    const int t = order[a];
++                    order[a] = order[b];
++                    order[b] = t;
++                }
++            }
++        }
++        for (int a = 0; a < n && a < 8; a++)
++        {
++            const int i = order[a];
++            const uint64_t cnt = SW_render_stats.kinds[i].count - sw_scene0.kinds[i].count;
++            const uint64_t px = SW_render_stats.kinds[i].pixels - sw_scene0.kinds[i].pixels;
++            PS2_Log("BENCH scene=%s copies: %s -> %s blend=%lu mod=%lu: %.1f per render, %.0f px per render",
++                    name, SDL_GetPixelFormatName(SW_render_stats.kinds[i].src_format),
++                    SDL_GetPixelFormatName(SW_render_stats.kinds[i].dst_format),
++                    (unsigned long) SW_render_stats.kinds[i].blend, (unsigned long) SW_render_stats.kinds[i].mod,
++                    cnt / r, px / r);
++        }
++    }
++    PS2_Log("BENCH scene=%s tower/title background full redraws: %lu in %lu logic ticks", name,
++            (unsigned long) (ps2_tower_full_redraws - tower_redraws0), (unsigned long) ticks);
++    PS2_Log("BENCH scene=%s profile samples=%lu (%.0f Hz, handler calls %lu, counter %lld)", name, (unsigned long) prof_n,
++            prof_n / secs, (unsigned long) prof_calls, (long long) prof_id);
++    write_csv(name);
++    write_profile(name);
++}
++
++/* ---- A/B pixel check of one frozen frame ---- */
++static uint32_t crc32(const uint8_t* p, size_t n)
++{
++    uint32_t c = 0xffffffffu;
++    while (n--)
++    {
++        c ^= *p++;
++        for (int k = 0; k < 8; k++)
++        {
++            c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
++        }
++    }
++    return ~c;
++}
++
++static void write_ppm(const char* path, const uint8_t* argb, int w, int h)
++{
++    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if (fd < 0)
++    {
++        return;
++    }
++    const char* hdr = "P6\n320 240\n255\n";
++    write(fd, hdr, strlen(hdr));
++    uint8_t* row = (uint8_t*) malloc(w * 3);
++    for (int y = 0; row && y < h; y++)
++    {
++        const uint8_t* src = argb + y * w * 4;
++        for (int x = 0; x < w; x++)
++        {
++            row[x * 3 + 0] = src[x * 4 + 2];
++            row[x * 3 + 1] = src[x * 4 + 1];
++            row[x * 3 + 2] = src[x * 4 + 0];
++        }
++        write(fd, row, w * 3);
++    }
++    free(row);
++    close(fd);
++}
++
++/* One render of the frozen golden state; logs its CRC and saves it. */
++static void golden_capture(void (*render)(void))
++{
++    SDL_Renderer* rend = gameScreen.m_renderer;
++    const int w = 320, h = 240, pitch = w * 4;
++    uint8_t* img = (uint8_t*) malloc(pitch * h);
++    want_golden = 0;
++    render();
++    if (img == NULL)
++    {
++        return;
++    }
++    /* the window as render() left it (what gets presented), then gameTexture */
++    SDL_Texture* prev = SDL_GetRenderTarget(rend);
++    SDL_SetRenderTarget(rend, NULL);
++    SDL_RenderReadPixels(rend, NULL, SDL_PIXELFORMAT_ARGB8888, img, pitch);
++    const uint32_t window_crc = crc32(img, pitch * h);
++    SDL_SetRenderTarget(rend, graphics.gameTexture);
++    SDL_RenderReadPixels(rend, NULL, SDL_PIXELFORMAT_ARGB8888, img, pitch);
++    SDL_SetRenderTarget(rend, prev);
++    PS2_Log("GOLDEN scene=%s ticks=%d crc32=%08lx window_crc32=%08lx", scenes[scene].name, ticks_since_setup,
++            (unsigned long) crc32(img, pitch * h), (unsigned long) window_crc);
++    char path[64];
++    SDL_snprintf(path, sizeof(path), "golden_%02d_%s.ppm", scene, scenes[scene].name);
++    write_ppm(path, img, w, h);
++    free(img);
++}
++
++void PS2Bench_Verify(void (*render)(void))
++{
++    if (want_golden)
++    {
++        golden_capture(render);
++        return;
++    }
++    SDL_Renderer* rend = gameScreen.m_renderer;
++    const uint32_t enabled_opts = ps2_opts;
++    const int w = 320, h = 240, pitch = w * 4;
++    uint8_t* img[2];
++    img[0] = (uint8_t*) malloc(pitch * h);
++    img[1] = (uint8_t*) malloc(pitch * h);
++    want_verify = 0;
++    if (img[0] == NULL || img[1] == NULL)
++    {
++        free(img[0]);
++        free(img[1]);
++        render();
++        return;
++    }
++    for (int pass = 0; pass < 2; pass++)
++    {
++        ps2_opts = pass == 0 ? 0 : enabled_opts;
++        srand(12345);
++        graphics.clear();
++        graphics.set_render_target(graphics.gameTexture);
++        render();
++        SDL_SetRenderTarget(rend, graphics.gameTexture);
++        SDL_RenderReadPixels(rend, NULL, SDL_PIXELFORMAT_ARGB8888, img[pass], pitch);
++    }
++    ps2_opts = enabled_opts;
++    uint32_t diff = 0;
++    for (int i = 0; i < w * h; i++)
++    {
++        diff += ((const uint32_t*) img[0])[i] != ((const uint32_t*) img[1])[i];
++    }
++    PS2_Log("VERIFY scene=%s opts=0x%lx: %lu of %d pixels differ between reference and optimised render",
++               scenes[scene].name, (unsigned long) enabled_opts, (unsigned long) diff, w * h);
++    char path[64];
++    SDL_snprintf(path, sizeof(path), "frame_%02d_%s.ppm", scene, scenes[scene].name);
++    write_ppm(path, img[1], w, h);
++    free(img[0]);
++    free(img[1]);
++    graphics.set_render_target(graphics.gameTexture);
++}
++
++/* ---- scene driver (between frames) ---- */
++static void enter(Phase p)
++{
++    phase = p;
++    phase_t0 = PS2_NowUs();
++    phase_loops = 0;
++}
++
++static void start_measure(void)
++{
++    n_frames = 0;
++    sw_scene0 = SW_render_stats;
++    tower_redraws0 = ps2_tower_full_redraws;
++#ifdef VVV_MUSIC_STREAMING
++    StreamStats ms;
++    MUSIC_GetStreamStats(&ms);
++    decode_total0 = ms.decode_us_total;
++    underruns0 = ms.underruns;
++#endif
++    prof_n = 0;
++    prof_on = cfg_profile;
++    PS2_LogDefer(1);
++    measure_t0 = PS2_NowUs();
++    enter(P_MEASURE);
++}
++
++void PS2Bench_LoopEnd(void)
++{
++    if (!enabled)
++    {
++        return;
++    }
++    const uint64_t now = PS2_NowUs();
++    const double t = (now - phase_t0) / 1e6;
++    phase_loops++;
++    if (ride_camera && map.towermode && !frozen)
++    {
++        const int i = obj.getplayer();
++        if (INBOUNDS_VEC(i, obj.entities))
++        {
++            obj.entities[i].yp = map.ypos + 120;
++            obj.entities[i].lerpoldyp = obj.entities[i].yp;
++        }
++    }
++    switch (phase)
++    {
++    case P_BOOT:
++        if (game.gamestate != TITLEMODE)
++        {
++            ticks_since_setup = 0;
++        }
++        else if (ticks_since_setup >= 300)
++        {
++            if (cfg_profile)
++            {
++                prof_start();
++            }
++            scene = -1;
++            pass = cfg_golden_ticks > 0 ? 0 : 1;
++            enter(P_NEXT);
++        }
++        break;
++    case P_NEXT:
++        do
++        {
++            scene++;
++        }
++        while (scene < NUM_SCENES && !scene_selected(scene));
++        if (scene >= NUM_SCENES && pass == 0)
++        {
++            pass = 1;
++            scene = -1;
++            break;
++        }
++        if (scene >= NUM_SCENES)
++        {
++            PS2_Log("BENCH done (emulated time since boot %.1f s)", now / 1e6);
++            {
++                int fd = open("bench_results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
++                if (fd >= 0)
++                {
++                    write(fd, results, results_len);
++                    close(fd);
++                }
++                PS2_Log("BENCH results:\n%s", results);
++                PS2_LogFlushNow();
++                PS2Diag_SetStatus(fd >= 0 ? "BENCH DONE: see bench_results.txt" : "BENCH DONE (results file not written)");
++                PS2Diag_SetOverlay(1);
++            }
++            enter(P_DONE);
++            break;
++        }
++        PS2_Log("BENCH %s scene %d %s: setup (gamestate=%d)", pass == 0 ? "golden" : "measure", scene,
++                scenes[scene].name, game.gamestate);
++        srand(1);
++        ride_camera = false;
++        scenes[scene].setup();
++        if (cfg_over30 >= 0)
++        {
++            game.over30mode = cfg_over30 != 0;
++        }
++        ticks_since_setup = 0;
++        enter(pass == 0 ? P_GOLDEN : P_SETTLE);
++        break;
++    case P_GOLDEN:
++        if (ticks_since_setup >= cfg_golden_ticks)
++        {
++            frozen = 1;
++            want_golden = 1;
++            enter(P_GOLDEN_CAPTURE);
++        }
++        break;
++    case P_GOLDEN_CAPTURE:
++        if (!want_golden)
++        {
++            frozen = 0;
++            enter(P_NEXT);
++        }
++        break;
++    case P_SETTLE:
++        if (t >= cfg_settle_s + scenes[scene].extra_settle_s)
++        {
++            PS2_Log("BENCH scene %d %s: measuring (gamestate=%d room=%d,%d)", scene, scenes[scene].name,
++                    game.gamestate, game.roomx, game.roomy);
++            start_measure();
++        }
++        break;
++    case P_MEASURE:
++        if (t >= cfg_measure_s)
++        {
++            prof_on = 0;
++            measure_t1 = now;
++            PS2_LogDefer(0);
++            report();
++            frozen = 1;
++            enter(P_FREEZE);
++        }
++        break;
++    case P_FREEZE:
++        if (phase_loops >= 3)
++        {
++            want_verify = cfg_verify;
++            enter(P_VERIFY);
++        }
++        break;
++    case P_VERIFY:
++        if (phase_loops >= 2)
++        {
++            PS2_Snapshot(scenes[scene].name);
++            enter(P_SNAPSHOT);
++        }
++        break;
++    case P_SNAPSHOT:
++        frozen = 0;
++        enter(P_NEXT);
++        break;
++    case P_DONE:
++        break;
++    }
++}
+--- a/desktop_version/src/PS2Diag.h
++++ b/desktop_version/src/PS2Diag.h
+@@ -0,0 +1,47 @@
++#ifndef PS2DIAG_H
++#define PS2DIAG_H
++
++/* PS2 on-console diagnostics for hardware tests (PS2 build only):
++ *  - a text "boot console" (ps2sdk libdebug) listing start-up stages until
++ *    the game's renderer takes over the screen;
++ *  - a fatal screen that stays up instead of exiting (failed start-up,
++ *    VVV_exit with an error, CPU exceptions);
++ *  - the last error/warning logged, for the log file and the overlay;
++ *  - an optional overlay (L3+R3, or overlay.txt) with ticks/s, frame and
++ *    render time, music, underruns and free memory, redrawn once a second.
++ * See docs/ps2-h1-hardware-readiness.md. */
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void PS2Diag_Init(void); /* boot console + exception screen; first thing in PS2_PreInit */
++void PS2Diag_Stage(const char *fmt, ...);
++void PS2Diag_RendererReady(void); /* the game owns the GS from now on */
++void PS2Diag_Message(char level, const char *text); /* from vlog_*: 'E', 'W', 'I' */
++const char *PS2Diag_LastError(void);
++#ifdef __cplusplus
++[[noreturn]]
++#endif
++void PS2Diag_Fatal(const char *what);
++
++/* overlay and its statistics */
++void PS2Diag_Tick(void);                               /* one logic tick */
++void PS2Diag_Frame(uint32_t period_us, uint32_t render_us); /* once per loop */
++void PS2Diag_DrawOverlay(void);                        /* after render(), window is the target */
++void PS2Diag_SetOverlay(int on);
++void PS2Diag_SetStatus(const char *text); /* shown on the overlay's last line when there is no error */
++int PS2Diag_OverlayOn(void);
++
++/* set once a fatal/exception screen owns the display; the main loop then stops */
++int PS2Diag_Halted(void);
++/* build identity shown on every diagnostic screen and in the log */
++const char *PS2Diag_BuildId(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS2DIAG_H */
+--- a/desktop_version/src/PS2Diag.cpp
++++ b/desktop_version/src/PS2Diag.cpp
+@@ -0,0 +1,571 @@
++#include "PS2Diag.h"
++
++#include <SDL.h>
++#include <malloc.h>
++#include <stdarg.h>
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include <debug.h>
++#include <screenshot.h>
++#include <stdlib.h>
++#include <ee_debug.h>
++#include <kernel.h>
++#include <sio.h>
++
++#include "Font.h"
++#include "Game.h"
++#include "Graphics.h"
++#include "Music.h"
++#include "PS2Platform.h"
++#include "Screen.h"
++
++#define WHITE 0xffffffu
++#define GREY 0xa0a0a0u
++#define GREEN 0x40ff40u
++#define YELLOW 0x40ffffu /* libdebug colours are 0xBBGGRR */
++#define RED 0x4040ffu
++
++#ifndef VVV_PS2_BUILD_ID
++#define VVV_PS2_BUILD_ID "dev"
++#endif
++
++/* ---- boot console ---- */
++static volatile int halted;
++static bool console_active;   /* the libdebug text screen owns the GS */
++static bool renderer_ready;   /* the game's renderer owns the GS */
++static char last_stage[96] = "(none)";
++static char last_error[120];
++/* the last few errors/warnings, oldest first, for the fatal screen */
++static char recent[6][120];
++static int recent_next;
++static bool bootshot; /* bootshot.txt (host: tests): save the boot console before the renderer starts */
++/* stages seen before the log file exists, replayed into it by PS2Diag_Init */
++static char early[1024];
++static size_t early_len;
++
++/* libdebug text: 80 x 40 cells of 8x8. Rows are kept in a small buffer and
++ * each one is placed explicitly (scr_setXY), so the screen can be redrawn
++ * and no line depends on the console's own cursor or wrap-around. */
++static char screen_text[40][80];
++static uint32_t screen_colour[40];
++static int console_row;
++
++static void screen_reset(void)
++{
++    memset(screen_text, 0, sizeof(screen_text));
++}
++
++static void text_at(int row, uint32_t colour, const char *text)
++{
++    if (row < 0 || row >= 38)
++    {
++        return; /* keep the screen; the log file has everything */
++    }
++    SDL_snprintf(screen_text[row], sizeof(screen_text[row]), "  %.76s", text);
++    screen_colour[row] = colour;
++}
++
++static void screen_show(void)
++{
++    for (int row = 0; row < 40; row++)
++    {
++        if (screen_text[row][0])
++        {
++            scr_setXY(0, row);
++            scr_setfontcolor(screen_colour[row]);
++            scr_printf("%s", screen_text[row]);
++        }
++    }
++}
++
++static void show_row(int row)
++{
++    scr_setXY(0, row);
++    scr_setfontcolor(screen_colour[row]);
++    scr_printf("%s", screen_text[row]);
++}
++
++static void console_open(void)
++{
++    if (console_active || renderer_ready)
++    {
++        return;
++    }
++    init_scr();
++    scr_setCursor(0);
++    console_active = true;
++    screen_reset();
++    console_row = 1;
++    text_at(console_row++, WHITE, "VVVVVV for PlayStation 2 - experimental test build " VVV_PS2_BUILD_ID);
++    text_at(console_row++, WHITE, "start-up (the title screen replaces this text):");
++    console_row++;
++    screen_show();
++}
++
++static void console_line(uint32_t colour, const char *text)
++{
++    if (!console_active)
++    {
++        return;
++    }
++    text_at(console_row, colour, text);
++    if (console_row < 38)
++    {
++        show_row(console_row);
++    }
++    console_row++;
++}
++
++/* Called by SDL's PS2 main() (weak there) before SDL_main: IOP reset, driver
++ * loading, waiting for the boot device. No files can be written yet. */
++extern "C" void SDL_PS2_BootMessage(const char *message)
++{
++    console_open();
++    console_line(GREY, message);
++    SDL_strlcpy(last_stage, message, sizeof(last_stage));
++    const size_t n = strlen(message);
++    if (early_len + n + 2 < sizeof(early))
++    {
++        memcpy(early + early_len, message, n);
++        early_len += n;
++        early[early_len++] = '\n';
++        early[early_len] = '\0';
++    }
++}
++
++/* ---- CPU exceptions: a register screen instead of a silent hang ---- */
++static const char *exception_name(unsigned code)
++{
++    switch (code)
++    {
++    case 1: return "TLB modification";
++    case 2: return "TLB miss (load)";
++    case 3: return "TLB miss (store)";
++    case 4: return "address error (load/fetch)";
++    case 5: return "address error (store)";
++    case 6: return "bus error (fetch)";
++    case 7: return "bus error (data)";
++    case 10: return "reserved instruction";
++    case 12: return "arithmetic overflow";
++    case 13: return "trap";
++    default: return "exception";
++    }
++}
++
++/* The handler runs in exception context, where the kernel calls libdebug
++ * needs (SetGsCrt, FlushCache) are not allowed: it only saves the registers
++ * and resumes the faulting thread in exception_report(). */
++static EE_RegFrame saved_frame;
++static void save_text_screen(const char *name);
++
++static void exception_report(void)
++{
++    const EE_RegFrame *frame = &saved_frame;
++    halted = 1; /* the main loop stops at its next iteration, so it cannot draw over this */
++    const unsigned code = (frame->cause >> 2) & 31;
++    char text[96];
++    SDL_snprintf(text, sizeof(text), "VVVVVV PS2 exception screen: code %u EPC %08x BadVAddr %08x RA %08x",
++                 code, (unsigned) frame->epc, (unsigned) frame->badvaddr, (unsigned) frame->ra[0]);
++    sio_puts(text); /* EE serial console; PCSX2 shows it in its log */
++    init_scr();
++    scr_setCursor(0);
++    screen_reset();
++    SDL_snprintf(text, sizeof(text), "VVVVVV PS2: CPU EXCEPTION - %s (code %u)", exception_name(code), code);
++    text_at(1, RED, text);
++    SDL_snprintf(text, sizeof(text), "build %s, thread %d", VVV_PS2_BUILD_ID, GetThreadId());
++    text_at(2, WHITE, text);
++    SDL_snprintf(text, sizeof(text), "EPC      %08x   BadVAddr %08x", (unsigned) frame->epc, (unsigned) frame->badvaddr);
++    text_at(3, WHITE, text);
++    SDL_snprintf(text, sizeof(text), "RA       %08x   SP       %08x", (unsigned) frame->ra[0], (unsigned) frame->sp[0]);
++    text_at(4, WHITE, text);
++    SDL_snprintf(text, sizeof(text), "Cause    %08x   Status   %08x", (unsigned) frame->cause, (unsigned) frame->status);
++    text_at(5, WHITE, text);
++    SDL_snprintf(text, sizeof(text), "last start-up stage: %s", last_stage);
++    text_at(7, WHITE, text);
++    SDL_snprintf(text, sizeof(text), "last error: %s", last_error[0] ? last_error : "(none)");
++    text_at(8, WHITE, text);
++    text_at(10, YELLOW, "Please photograph this screen, then reset the console.");
++    text_at(11, YELLOW, "(EPC/RA can be looked up in the unstripped VVVVVV.elf)");
++    screen_show();
++    PS2_Log("EXCEPTION %s code %u EPC %08x BadVAddr %08x RA %08x", exception_name(code), code,
++            (unsigned) frame->epc, (unsigned) frame->badvaddr, (unsigned) frame->ra[0]);
++    if (!PS2_OnRealStorage())
++    {
++        save_text_screen("shot_exception.ppm");
++    }
++    PS2_LogFlushNow();
++    for (;;)
++    {
++        SleepThread();
++    }
++}
++
++static int exception_screen(EE_RegFrame *frame)
++{
++    static int entered;
++    if (entered++)
++    {
++        /* a second fault (e.g. while reporting the first): keep the first
++         * report; park this thread where it faulted */
++        for (;;)
++        {
++        }
++    }
++    memcpy(&saved_frame, frame, sizeof(saved_frame));
++    frame->epc = (u32) (uintptr_t) exception_report;
++    return 1;
++}
++
++static void install_exception_screen(void)
++{
++    static const int codes[] = {1, 2, 3, 4, 5, 6, 7, 10, 12, 13};
++    if (ee_dbg_install(1) != 0)
++    {
++        return;
++    }
++    for (size_t i = 0; i < SDL_arraysize(codes); i++)
++    {
++        ee_dbg_set_level1_handler(codes[i], exception_screen);
++    }
++}
++
++void PS2Diag_Init(void)
++{
++    console_open();
++    {
++        int fd = open("bootshot.txt", O_RDONLY);
++        bootshot = fd >= 0;
++        if (fd >= 0)
++        {
++            close(fd);
++        }
++    }
++    if (early_len > 0)
++    {
++        PS2_Log("BOOT (before the log existed):\n%s", early);
++    }
++    install_exception_screen();
++}
++
++void PS2Diag_Stage(const char *fmt, ...)
++{
++    char text[sizeof(last_stage)];
++    va_list ap;
++    va_start(ap, fmt);
++    SDL_vsnprintf(text, sizeof(text), fmt, ap);
++    va_end(ap);
++    SDL_strlcpy(last_stage, text, sizeof(last_stage));
++    PS2_Log("STAGE %s", text);
++    console_line(WHITE, text);
++    if (bootshot && console_active && !PS2_OnRealStorage() && strncmp(text, "settings loaded", 15) == 0)
++    {
++        save_text_screen("shot_boot_console.ppm");
++    }
++}
++
++void PS2Diag_RendererReady(void)
++{
++    console_active = false;
++    renderer_ready = true;
++}
++
++void PS2Diag_Message(char level, const char *text)
++{
++    /* PCSX2's host: refuses PhysFS a look outside the ELF folder at start-up
++     * (known since P2a, harmless); not worth showing as the last error */
++    if (level == 'E' && !PS2_OnRealStorage() && strncmp(text, "Could not stat file", 19) == 0)
++    {
++        PS2_Log("WARN (host: only, harmless) %s", text);
++        return;
++    }
++    PS2_Log("%s %s", level == 'E' ? "ERROR" : level == 'W' ? "WARN" : "INFO", text);
++    if (level == 'E' || level == 'W')
++    {
++        SDL_strlcpy(last_error, text, sizeof(last_error));
++        SDL_strlcpy(recent[recent_next], text, sizeof(recent[0]));
++        recent_next = (recent_next + 1) % 6;
++        console_line(level == 'E' ? RED : YELLOW, text);
++    }
++}
++
++const char *PS2Diag_LastError(void)
++{
++    return last_error;
++}
++
++/* PCSX2/host: only: save the text screen (libdebug: 640x448, PSMCT32 at
++ * VRAM 0) so automated tests can see it; on real storage this is skipped. */
++static void save_text_screen(const char *name)
++{
++    const int w = 640, h = 448;
++    SDL_Delay(300); /* let libdebug's last text DMA reach VRAM */
++    uint8_t *buf = (uint8_t *) memalign(64, w * h * 4);
++    if (buf == NULL)
++    {
++        return;
++    }
++    /* in bands: in PCSX2 a single whole-screen CT32 read returned only the
++     * top 40 lines (the rest came back black) */
++    for (int y = 0; y < h; y += 32)
++    {
++        ps2_screenshot(buf + y * w * 4, 0, 0, y, w, 32, 0 /* CT32 */);
++    }
++    int fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if (fd >= 0)
++    {
++        static uint8_t row[640 * 3];
++        const char *hdr = "P6\n640 448\n255\n";
++        write(fd, hdr, strlen(hdr));
++        for (int y = 0; y < h; y++)
++        {
++            for (int x = 0; x < w; x++)
++            {
++                memcpy(row + x * 3, buf + (y * w + x) * 4, 3);
++            }
++            write(fd, row, sizeof(row));
++        }
++        close(fd);
++    }
++    free(buf);
++}
++
++int PS2Diag_Halted(void)
++{
++    return halted;
++}
++
++const char *PS2Diag_BuildId(void)
++{
++    return VVV_PS2_BUILD_ID;
++}
++
++void PS2Diag_Fatal(const char *what)
++{
++    char cwd[128];
++    halted = 1;
++    PS2_Log("FATAL %s | last stage: %s | last error: %s", what, last_stage, last_error[0] ? last_error : "(none)");
++    PS2_LogFlushNow();
++    if (!getcwd(cwd, sizeof(cwd)))
++    {
++        SDL_strlcpy(cwd, "?", sizeof(cwd));
++    }
++    char text[160];
++    int row = 1;
++    init_scr();
++    scr_setCursor(0);
++    screen_reset();
++    text_at(row, RED, "VVVVVV PS2: FATAL ERROR");
++    SDL_snprintf(text, sizeof(text), "build %s", VVV_PS2_BUILD_ID);
++    text_at(row + 1, WHITE, text);
++    row += 3;
++    text_at(row++, WHITE, what);
++    row++;
++    SDL_snprintf(text, sizeof(text), "last start-up stage: %s", last_stage);
++    text_at(row++, WHITE, text);
++    row++;
++    text_at(row++, WHITE, "last errors/warnings:");
++    for (int i = 0; i < 6; i++)
++    {
++        const char *e = recent[(recent_next + i) % 6];
++        if (e[0])
++        {
++            SDL_snprintf(text, sizeof(text), " %s", e);
++            text_at(row++, YELLOW, text);
++        }
++    }
++    row++;
++    SDL_snprintf(text, sizeof(text), "log file: %svvvvvv_ps2.log (if the device is writable)", cwd);
++    text_at(row++, WHITE, text);
++    row++;
++    text_at(row++, GREEN, "Please photograph this screen, then reset the console.");
++    screen_show();
++    if (!PS2_OnRealStorage())
++    {
++        save_text_screen("shot_fatal.ppm");
++    }
++    for (;;)
++    {
++        SleepThread();
++    }
++}
++
++/* ---- overlay ---- */
++static int overlay_on;
++static bool overlay_dirty;
++static SDL_Texture *overlay_tex;
++static char lines[3][48];
++static uint8_t line_rgb[3][3];
++static uint32_t win_ticks, win_loops, win_renders;
++static uint64_t win_period, win_render, win_t0;
++#ifdef VVV_MUSIC_STREAMING
++static uint64_t win_decode0;
++#endif
++static char status_text[48];
++static SDL_GameController *pad;
++static bool combo_was_down;
++
++#define OVERLAY_Y 16 /* below the top overscan of a CRT */
++#define OVERLAY_H 32
++
++void PS2Diag_Tick(void)
++{
++    win_ticks++;
++}
++
++void PS2Diag_Frame(uint32_t period_us, uint32_t render_us)
++{
++    win_loops++;
++    win_period += period_us;
++    if (render_us)
++    {
++        win_renders++;
++        win_render += render_us;
++    }
++}
++
++void PS2Diag_SetStatus(const char *text)
++{
++    SDL_strlcpy(status_text, text, sizeof(status_text));
++}
++
++void PS2Diag_SetOverlay(int on)
++{
++    overlay_on = on;
++    win_t0 = 0;
++}
++
++int PS2Diag_OverlayOn(void)
++{
++    return overlay_on;
++}
++
++static void set_line(int i, uint8_t r, uint8_t g, uint8_t b, const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    SDL_vsnprintf(lines[i], sizeof(lines[i]), fmt, ap);
++    va_end(ap);
++    line_rgb[i][0] = r;
++    line_rgb[i][1] = g;
++    line_rgb[i][2] = b;
++}
++
++/* once a second: turn the window's counters into three short text lines */
++static void update_text(uint64_t now)
++{
++    const double secs = (now - win_t0) / 1e6;
++    const double tps = win_ticks / secs, target = 1000.0 / game.get_timestep();
++    const double frame = win_loops ? win_period / (double) win_loops / 1000.0 : 0.0;
++    const double render = win_renders ? win_render / (double) win_renders / 1000.0 : 0.0;
++    struct mallinfo mi = mallinfo();
++    const double free_mb = ((char *) EndOfHeap() - (char *) sbrk(0) + (double) mi.fordblks) / 1048576.0;
++    const bool slow = tps < target - 0.5;
++
++    set_line(0, 255, slow ? 128 : 255, slow ? 128 : 255, "TPS %4.1f/%4.1f FRAME %4.1fms RND %4.1fms",
++             tps, target, frame, render);
++#ifdef VVV_MUSIC_STREAMING
++    StreamStats ms;
++    MUSIC_GetStreamStats(&ms);
++    const double decode = (ms.decode_us_total - win_decode0) / secs / 1000.0;
++    win_decode0 = ms.decode_us_total;
++    set_line(1, 255, ms.underruns ? 128 : 255, ms.underruns ? 128 : 255, "MUSIC %s %3.0fms/s UNDERRUN %lu FREE %3.1fM",
++             ms.active ? "on " : "off", decode, (unsigned long) ms.underruns, free_mb);
++#else
++    set_line(1, 255, 255, 255, "MUSIC off (build)  FREE %3.1fM", free_mb);
++#endif
++    if (last_error[0])
++    {
++        set_line(2, 255, 200, 64, "ERR %.34s", last_error);
++    }
++    else
++    {
++        set_line(2, 128, 255, 128, "%s", status_text[0] ? status_text : "STATUS OK  " VVV_PS2_BUILD_ID "  L3+R3 hides");
++    }
++    win_ticks = win_loops = win_renders = 0;
++    win_period = win_render = 0;
++    win_t0 = now;
++    overlay_dirty = true;
++}
++
++static void poll_combo(void)
++{
++    static uint32_t refresh;
++    if (pad == NULL || (++refresh % 64) == 0)
++    {
++        pad = NULL;
++        for (int i = 0; i < SDL_NumJoysticks() && pad == NULL; i++)
++        {
++            if (SDL_IsGameController(i))
++            {
++                pad = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
++            }
++        }
++    }
++    if (pad == NULL)
++    {
++        return;
++    }
++    /* both stick clicks: VVVVVV binds neither by default */
++    const bool down = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK) &&
++                      SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
++    if (down && !combo_was_down)
++    {
++        PS2Diag_SetOverlay(!overlay_on);
++        PS2_Log("OVERLAY %s (L3+R3)", overlay_on ? "on" : "off");
++    }
++    combo_was_down = down;
++}
++
++void PS2Diag_DrawOverlay(void)
++{
++    SDL_Renderer *rend = gameScreen.m_renderer;
++    poll_combo();
++    if (!overlay_on || rend == NULL)
++    {
++        return;
++    }
++    const uint64_t now = PS2_NowUs();
++    if (win_t0 == 0)
++    {
++        win_t0 = now;
++        win_ticks = win_loops = win_renders = 0;
++        win_period = win_render = 0;
++        set_line(0, 255, 255, 255, "diagnostics: first values in 1 s");
++        lines[1][0] = lines[2][0] = '\0';
++        overlay_dirty = true;
++    }
++    else if (now - win_t0 >= 1000000)
++    {
++        update_text(now);
++    }
++
++    SDL_Texture *target = SDL_GetRenderTarget(rend);
++    if (overlay_tex == NULL)
++    {
++        overlay_tex = SDL_CreateTexture(rend, VVV_TARGET_PIXELFORMAT, SDL_TEXTUREACCESS_TARGET, 320, OVERLAY_H);
++        if (overlay_tex == NULL)
++        {
++            overlay_on = 0;
++            return;
++        }
++        SDL_SetTextureBlendMode(overlay_tex, SDL_BLENDMODE_NONE);
++    }
++    if (overlay_dirty)
++    {
++        /* text is drawn only when it changes: about 3 x 40 glyphs a second */
++        graphics.set_render_target(overlay_tex);
++        graphics.clear(0, 0, 0, 255);
++        for (int i = 0; i < 3; i++)
++        {
++            font::print(0, 4, 1 + i * 10, lines[i], line_rgb[i][0], line_rgb[i][1], line_rgb[i][2]);
++        }
++        overlay_dirty = false;
++    }
++    /* per frame: one unblended 320x32 copy onto the finished window */
++    graphics.set_render_target(NULL);
++    const SDL_Rect dst = {0, OVERLAY_Y, 320, OVERLAY_H};
++    SDL_RenderCopy(rend, overlay_tex, NULL, &dst);
++    graphics.set_render_target(target);
++}
+--- a/desktop_version/src/main.cpp
++++ b/desktop_version/src/main.cpp
+@@ -35,6 +35,11 @@
+ #include "Script.h"
+ #include "UtilityClass.h"
+ #include "Vlogging.h"
++#ifdef __PS2__
++#include "PS2Bench.h"
++#include "PS2Diag.h"
++#include "PS2Platform.h"
++#endif
+ 
+ scriptclass script;
+ 
+@@ -604,12 +609,23 @@
+     /* We already do the button swapping in ButtonGlyphs, disable SDL's swapping */
+     SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0", SDL_HINT_OVERRIDE);
+ 
++#ifdef __PS2__
++    PS2_PreInit(argc, argv);
++#endif
++
+     if(!FILESYSTEM_init(argv[0], baseDir, assetsPath, langDir, fontsDir))
+     {
+         vlog_error("Unable to initialize filesystem!");
++#ifdef __PS2__
++        vlog_error("PS2: the game's folder must be writable (savedata/ is created next to VVVVVV.elf):");
++        vlog_error("is the USB stick write-protected, full, or not FAT32?");
++#endif
+         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Unable to initialize filesystem!", NULL);
+         VVV_exit(1);
+     }
++#ifdef __PS2__
++    PS2Diag_Stage("filesystem ready");
++#endif
+ 
+     SDL_Init(
+         SDL_INIT_VIDEO |
+@@ -617,6 +633,9 @@
+         SDL_INIT_JOYSTICK |
+         SDL_INIT_GAMECONTROLLER
+     );
++#ifdef __PS2__
++    PS2_PostInit();
++#endif
+     if (SDL_IsTextInputActive() == SDL_TRUE)
+     {
+         SDL_StopTextInput();
+@@ -680,13 +699,23 @@
+         ScreenSettings_default(&screen_settings);
+         game.loadstats(&screen_settings);
+         game.loadsettings(&screen_settings);
++#ifdef __PS2__
++        PS2Diag_Stage("settings loaded; starting the renderer (this text disappears)");
++#endif
+         gameScreen.init(&screen_settings);
++#ifdef __PS2__
++        PS2Diag_RendererReady();
++        PS2Diag_Stage("renderer ready");
++#endif
+     }
+ 
+     BUTTONGLYPHS_init();
+     font::load_main();
+     font::bidi_init();
+ 
++#ifdef __PS2__
++    PS2Diag_Stage("loading graphics, sounds and music");
++#endif
+     // This loads music too...
+     if (!graphics.reloadresources())
+     {
+@@ -711,6 +740,9 @@
+     game.createmenu(Menu::mainmenu);
+ 
+     graphics.create_buffers();
++#ifdef __PS2__
++    PS2Diag_Stage("resources loaded, entering the main loop");
++#endif
+ 
+     if (game.skipfakeload)
+         game.gamestate = TITLEMODE;
+@@ -880,7 +912,13 @@
+         timePrev = time_;
+         time_ = SDL_GetTicks64();
+ 
++#ifdef __PS2__
++        PS2_LoopBegin();
++#endif
+         deltaloop();
++#ifdef __PS2__
++        PS2_LoopEnd();
++#endif
+     }
+ 
+     cleanup();
+@@ -913,6 +951,14 @@
+ 
+ SDL_NORETURN void VVV_exit(const int exit_code)
+ {
++#ifdef __PS2__
++    if (exit_code != 0)
++    {
++        char what[64];
++        SDL_snprintf(what, sizeof(what), "VVVVVV stopped with error code %d.", exit_code);
++        PS2Diag_Fatal(what);
++    }
++#endif
+     cleanup();
+     exit(exit_code);
+ }
+@@ -925,6 +971,12 @@
+ 
+     Uint32 timesteplimit = game.get_timestep();
+ 
++#ifdef __PS2__
++    if (PS2Bench_LogicFrozen())
++    {
++        accumulator = 0;
++    }
++#endif
+     while (accumulator >= timesteplimit)
+     {
+         enum IndexCode index_code = increment_func_index();
+@@ -936,10 +988,16 @@
+ 
+         accumulator = SDL_fmodf(accumulator, timesteplimit);
+ 
++#ifdef __PS2__
++        PS2Bench_LogicBegin();
++#endif
+         /* We are done rendering. */
+         graphics.renderfixedpost();
+ 
+         fixedloop();
++#ifdef __PS2__
++        PS2Bench_LogicEnd();
++#endif
+     }
+     const float alpha = game.over30mode ? static_cast<float>(accumulator) / timesteplimit : 1.0f;
+     graphics.alpha = alpha;
+@@ -958,13 +1016,32 @@
+ 
+         if (implfunc->type == Func_delta && implfunc->func != NULL)
+         {
++#ifdef __PS2__
++            PS2_RenderBegin();
++#endif
++#ifdef __PS2__
++            if (!graphics.ps2_window_clear_redundant())
++#endif
+             graphics.clear();
+ 
+             graphics.set_render_target(graphics.gameTexture);
+ 
++#ifdef __PS2__
++            if (PS2Bench_WantsVerify())
++            {
++                PS2Bench_Verify(implfunc->func);
++            }
++            else
++#endif
+             implfunc->func();
++#ifdef __PS2__
++            PS2Diag_DrawOverlay();
++#endif
+ 
+             gameScreen.RenderPresent();
++#ifdef __PS2__
++            PS2_RenderEnd();
++#endif
+         }
+     }
+ }
+--- a/desktop_version/src/FileSystemUtils.cpp
++++ b/desktop_version/src/FileSystemUtils.cpp
+@@ -18,6 +18,10 @@
+ #include "UtilityClass.h"
+ #include "VFormat.h"
+ #include "Vlogging.h"
++#ifdef __PS2__
++#include "PS2Diag.h"
++#include "PS2Platform.h"
++#endif
+ 
+ /* These are needed for PLATFORM_* crap */
+ #if defined(_WIN32)
+@@ -35,6 +39,33 @@
+ #include <sys/stat.h>
+ #include <emscripten.h>
+ #define MAX_PATH PATH_MAX
++#elif defined(__PS2__)
++#include <errno.h>
++#include <limits.h>
++#include <sys/stat.h>
++#define MAX_PATH PATH_MAX
++/* PS2 device paths ("host:/x/", "mass:/x/"): some IOP filesystem drivers
++ * reject a trailing separator, so strip it, and log failures other than
++ * "already exists" since a missing save dir silently breaks saving. */
++static int ps2_mkdir(const char* path, int mode)
++{
++    char tmp[MAX_PATH];
++    size_t len;
++    int result;
++    SDL_strlcpy(tmp, path, sizeof(tmp));
++    len = SDL_strlen(tmp);
++    while (len > 1 && tmp[len - 1] == '/' && tmp[len - 2] != ':')
++    {
++        tmp[--len] = '\0';
++    }
++    result = mkdir(tmp, mode);
++    if (result != 0 && errno != EEXIST)
++    {
++        vlog_warn("mkdir(%s) failed: errno %d", tmp, errno);
++    }
++    return result;
++}
++#define mkdir ps2_mkdir
+ #elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__HAIKU__) || defined(__DragonFly__) || defined(__unix__)
+ #include <limits.h>
+ #include <sys/stat.h>
+@@ -325,11 +356,33 @@
+             basePath,
+             "data.zip"
+         );
++#ifdef __PS2__
++        /* Prefer the PS2 repack (music blob stored, see repack-data-zip.py),
++         * so the user's original data.zip can stay untouched next to it. */
++        {
++            char ps2zip[MAX_PATH];
++            SDL_RWops* probe;
++            SDL_snprintf(ps2zip, sizeof(ps2zip), "%s%s", basePath, "data-ps2.zip");
++            probe = SDL_RWFromFile(ps2zip, "rb");
++            if (probe != NULL)
++            {
++                SDL_RWclose(probe);
++                SDL_strlcpy(output, ps2zip, sizeof(output));
++            }
++        }
++        vlog_info("Assets archive: %s", output);
++#ifdef __PS2__
++        PS2Diag_Stage("assets archive: %s", output);
++#endif
++#endif
+     }
+     if (!PHYSFS_mount(output, NULL, 1))
+ #endif
+     {
+         vlog_error("Error: data.zip missing!");
++#ifdef __PS2__
++        vlog_error("PS2: put data-ps2.zip (scripts/make-usb-package.sh) next to VVVVVV.elf in %s", basePath);
++#endif
+         vlog_error("You do not have data.zip!");
+         vlog_error("Grab it from your purchased copy of the game,");
+         vlog_error("or get it from the free Make and Play Edition.");
+@@ -863,6 +916,9 @@
+     PHYSFS_File *handle;
+     PHYSFS_sint64 length;
+     PHYSFS_sint64 bytes_read;
++#ifdef __PS2__
++    uint64_t ps2_t0; /* no initializer: the gotos below jump past this */
++#endif
+ 
+     if (name == NULL || mem == NULL)
+     {
+@@ -894,6 +950,9 @@
+         return;
+     }
+ 
++#ifdef __PS2__
++    ps2_t0 = PS2_NowUs();
++#endif
+     handle = PHYSFS_openRead(name);
+     if (handle == NULL)
+     {
+@@ -926,6 +985,9 @@
+         VVV_free(*mem);
+     }
+     PHYSFS_close(handle);
++#ifdef __PS2__
++    PS2_LogAssetLoad(name, (size_t) length, PS2_NowUs() - ps2_t0);
++#endif
+     return;
+ 
+ fail:
+--- a/desktop_version/src/ButtonGlyphs.cpp
++++ b/desktop_version/src/ButtonGlyphs.cpp
+@@ -202,6 +202,11 @@
+     Uint16 vendor = SDL_GameControllerGetVendor(c);
+     Uint16 product = SDL_GameControllerGetProduct(c);
+ 
++#ifdef __PS2__
++    /* SDL's PS2 joystick driver reports VID/PID 0 for the console's own pads */
++    vendor = 0x054c;
++#endif
++
+     if (vendor == 0x054c)
+     {
+         layout = LAYOUT_PLAYSTATION;
+--- a/desktop_version/src/Vlogging.c
++++ b/desktop_version/src/Vlogging.c
+@@ -105,6 +105,20 @@
+ #endif
+ }
+ 
++#ifdef __PS2__
++#include <SDL_stdinc.h>
++#include "PS2Diag.h"
++
++/* PS2: the console has no stdout to look at; send messages to the log file
++ * and keep the last error/warning for the fatal screen and the overlay. */
++static void ps2_message(char level, const char* text, va_list list)
++{
++    char buffer[256];
++    SDL_vsnprintf(buffer, sizeof(buffer), text, list);
++    PS2Diag_Message(level, buffer);
++}
++#endif
++
+ SDL_PRINTF_VARARG_FUNC(1) void vlog_info(const char* text, ...)
+ {
+     va_list list;
+@@ -113,6 +127,11 @@
+     {
+         return;
+     }
++#ifdef __PS2__
++    va_start(list, text);
++    ps2_message('I', text, list);
++    va_end(list);
++#endif
+ 
+ #ifdef VLOG_USE_SDL
+     va_start(list, text);
+@@ -140,6 +159,11 @@
+     {
+         return;
+     }
++#ifdef __PS2__
++    va_start(list, text);
++    ps2_message('W', text, list);
++    va_end(list);
++#endif
+ 
+ #ifdef VLOG_USE_SDL
+     va_start(list, text);
+@@ -167,6 +191,11 @@
+     {
+         return;
+     }
++#ifdef __PS2__
++    va_start(list, text);
++    ps2_message('E', text, list);
++    va_end(list);
++#endif
+ 
+ #ifdef VLOG_USE_SDL
+     va_start(list, text);

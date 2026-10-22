@@ -1,0 +1,72 @@
+--- a/desktop_version/CMakeLists.txt
++++ b/desktop_version/CMakeLists.txt
+@@ -47,7 +47,7 @@
+ endif()
+ 
+ # RPATH
+-if(NOT WIN32)
++if(NOT WIN32 AND NOT PS2) # PS2: static ELF, no RPATH (and the flag list below would break its linker script flags)
+     if(APPLE)
+         set(BIN_RPATH "@executable_path/osx")
+     else()
+@@ -131,6 +131,11 @@
+     list(APPEND VVV_C_SRC src/GOGNetwork.c)
+ endif()
+ 
++if(PS2)
++    # PlayStation 2: set by the ps2sdk toolchain file ($PS2DEV/share/ps2dev.cmake)
++    list(APPEND VVV_CXX_SRC src/PS2Platform.cpp src/PS2Bench.cpp src/PS2Diag.cpp)
++endif()
++
+ set(VVV_SRC ${VVV_CXX_SRC} ${VVV_C_SRC})
+ 
+ # Executable information
+@@ -142,6 +147,26 @@
+     add_executable(VVVVVV ${VVV_SRC})
+ endif()
+ 
++# Stream music tracks from the blob instead of loading it (see Music.cpp).
++# Needs the blob stored uncompressed (scripts/repack-data-zip.py for data.zip).
++option(MUSIC_STREAMING "Stream music from vvvvvvmusic.vvv instead of loading it into RAM" OFF)
++
++if(PS2)
++    option(PS2_MUSIC "PS2: play music (streamed; OFF disables music entirely)" ON)
++    if(PS2_MUSIC)
++        set(MUSIC_STREAMING ON)
++    else()
++        target_compile_definitions(VVVVVV PRIVATE VVV_PS2_NO_MUSIC)
++    endif()
++    set_target_properties(VVVVVV PROPERTIES SUFFIX ".elf")
++    # libdebug: ps2_screenshot() for the GS snapshots in PS2Platform.cpp
++    # Build identity on the diagnostic screens and in the log (release candidates)
++    set(PS2_BUILD_ID "dev" CACHE STRING "PS2: build identifier shown on diagnostic screens")
++    target_compile_definitions(VVVVVV PRIVATE VVV_PS2_BUILD_ID="${PS2_BUILD_ID}")
++    # libdebug: text screen + GS snapshots; libeedebug: CPU exception screen (PS2Diag.cpp)
++    target_link_libraries(VVVVVV -ldebug -leedebug)
++endif()
++
+ # Include Directories
+ if(BUNDLE_DEPENDENCIES)
+     target_include_directories(
+@@ -203,6 +228,7 @@
+     ../third_party/physfs/src/physfs_platform_windows.c
+     ../third_party/physfs/src/physfs_platform_haiku.cpp
+     ../third_party/physfs/src/physfs_platform_android.c
++    ../third_party/physfs/src/physfs_platform_ps2.c
+ )
+ if(APPLE)
+     # Are you noticing a pattern with this Apple crap yet?
+@@ -471,3 +497,13 @@
+     # 256MB is enough for everybody
+     target_link_libraries(VVVVVV -sFORCE_FILESYSTEM=1 -sTOTAL_MEMORY=256MB)
+ endif()
++
++if(MUSIC_STREAMING)
++    target_compile_definitions(VVVVVV PRIVATE VVV_MUSIC_STREAMING)
++endif()
++
++if(PS2 AND BUNDLE_DEPENDENCIES)
++    # newlib's int32_t is 'long' on the EE; FAudio passes it where SDL wants
++    # int* (same size and ABI). ps2sdk-ports builds FAudio with this flag too.
++    target_compile_options(faudio-static PRIVATE -Wno-error=incompatible-pointer-types)
++endif()

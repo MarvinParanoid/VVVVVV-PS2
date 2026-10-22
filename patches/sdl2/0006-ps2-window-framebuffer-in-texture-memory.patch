@@ -1,0 +1,82 @@
+--- a/src/video/SDL_video.c
++++ b/src/video/SDL_video.c
+@@ -210,8 +210,15 @@
+     void *pixels;
+     int pitch;
+     int bytes_per_pixel;
++#ifdef __PS2__
++    SDL_bool pixels_in_texture; /* pixels is the streaming texture's own memory */
++#endif
+ } SDL_WindowTextureData;
+ 
++#ifdef __PS2__
++extern SDL_bool SDL_PS2P3FastpathsEnabled(void); /* SDL_blit.c */
++#endif
++
+ static Uint32 SDL_DefaultGraphicsBackends(SDL_VideoDevice *_this)
+ {
+ #if (defined(SDL_VIDEO_OPENGL) && defined(__MACOSX__)) || (defined(__IPHONEOS__) && !TARGET_OS_MACCATALYST) || defined(__ANDROID__) || defined(__NACL__)
+@@ -312,6 +319,11 @@
+         SDL_DestroyTexture(data->texture);
+         data->texture = NULL;
+     }
++#ifdef __PS2__
++    if (data->pixels_in_texture) {
++        data->pixels_in_texture = SDL_FALSE; /* freed with the texture */
++    } else
++#endif
+     SDL_free(data->pixels);
+     data->pixels = NULL;
+ 
+@@ -338,6 +350,28 @@
+     data->bytes_per_pixel = SDL_BYTESPERPIXEL(*format);
+     data->pitch = (((w * data->bytes_per_pixel) + 3) & ~3);
+ 
++#ifdef __PS2__
++    /* SDL_PS2_P3_FASTPATHS: let the software renderer draw straight into the
++     * texture's memory, so SDL_UpdateWindowTexture() does not copy the whole
++     * frame again (the GS upload reads that memory during present, which
++     * waits for the GS before returning). */
++    if (SDL_PS2P3FastpathsEnabled()) {
++        void *texpixels;
++        int texpitch;
++        if (SDL_LockTexture(data->texture, NULL, &texpixels, &texpitch) == 0) {
++            SDL_UnlockTexture(data->texture);
++            if (texpitch == data->pitch) {
++                data->pixels = texpixels;
++                data->pixels_in_texture = SDL_TRUE;
++                *pixels = data->pixels;
++                *pitch = data->pitch;
++                SDL_RenderSetViewport(data->renderer, NULL);
++                return 0;
++            }
++        }
++    }
++#endif
++
+     {
+         /* Make static analysis happy about potential SDL_malloc(0) calls. */
+         const size_t allocsize = (size_t)h * data->pitch;
+@@ -405,6 +439,9 @@
+     if (data->renderer) {
+         SDL_DestroyRenderer(data->renderer);
+     }
++#ifdef __PS2__
++    if (!data->pixels_in_texture)
++#endif
+     SDL_free(data->pixels);
+     SDL_free(data);
+ }
+--- a/src/render/ps2/SDL_render_ps2.c
++++ b/src/render/ps2/SDL_render_ps2.c
+@@ -264,7 +264,9 @@
+     PS2_LockTexture(renderer, texture, rect, (void **)&dst, &dpitch);
+     row_start = dst;
+     length = rect->w * SDL_BYTESPERPIXEL(texture->format);
+-    if (length == pitch && length == dpitch) {
++    if (src == dst && pitch == dpitch) {
++        /* already in place: the window framebuffer is this texture's memory */
++    } else if (length == pitch && length == dpitch) {
+         SDL_memcpy(dst, src, length * rect->h);
+     } else {
+         for (row = 0; row < rect->h; ++row) {

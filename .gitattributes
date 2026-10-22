@@ -1,0 +1,4 @@
+# Keep every text file LF-only: the shell scripts and the build container need it.
+* text=auto eol=lf
+# Patches are applied byte for byte (whitespace and line endings matter).
+*.patch -text

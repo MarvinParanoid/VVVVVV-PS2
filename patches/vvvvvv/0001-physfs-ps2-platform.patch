@@ -1,0 +1,124 @@
+--- a/third_party/physfs/src/physfs_platforms.h
++++ b/third_party/physfs/src/physfs_platforms.h
+@@ -69,6 +69,12 @@
+ #elif defined(__QNX__)
+ #  define PHYSFS_PLATFORM_QNX 1
+ #  define PHYSFS_PLATFORM_POSIX 1
++#elif defined(__ps2sdk__)
++/* PlayStation 2 (ps2sdk/newlib): POSIX file APIs via libcglue, no CD-ROM
++ * enumeration; base/pref dirs in physfs_platform_ps2.c */
++#  define PHYSFS_PLATFORM_PS2 1
++#  define PHYSFS_PLATFORM_POSIX 1
++#  define PHYSFS_NO_CDROM_SUPPORT 1
+ #elif defined(unix) || defined(__unix__)
+ #  define PHYSFS_PLATFORM_UNIX 1
+ #  define PHYSFS_PLATFORM_POSIX 1
+--- a/third_party/physfs/src/physfs_internal.h
++++ b/third_party/physfs/src/physfs_internal.h
+@@ -115,7 +115,9 @@
+ __PHYSFS_COMPILE_TIME_ASSERT(LongEqualsInt, sizeof (int) == sizeof (long));
+ #define __PHYSFS_ATOMIC_INCR(ptrval) _InterlockedIncrement((long*)(ptrval))
+ #define __PHYSFS_ATOMIC_DECR(ptrval) _InterlockedDecrement((long*)(ptrval))
+-#elif defined(__clang__) || (defined(__GNUC__) && (((__GNUC__ * 10000) + (__GNUC_MINOR__ * 100)) >= 40100))
++#elif (defined(__clang__) || (defined(__GNUC__) && (((__GNUC__ * 10000) + (__GNUC_MINOR__ * 100)) >= 40100))) && !defined(__ps2sdk__)
++/* (PS2: the R5900 has no LL/SC and the toolchain ships no __sync_* helpers;
++ * use the mutex-based fallback below instead.) */
+ #define __PHYSFS_ATOMIC_INCR(ptrval) __sync_add_and_fetch(ptrval, 1)
+ #define __PHYSFS_ATOMIC_DECR(ptrval) __sync_add_and_fetch(ptrval, -1)
+ #elif defined(__WATCOMC__) && defined(__386__)
+--- a/third_party/physfs/src/physfs_platform_ps2.c
++++ b/third_party/physfs/src/physfs_platform_ps2.c
+@@ -0,0 +1,93 @@
++/*
++ * PlayStation 2 support routines for PhysicsFS (ps2sdk / newlib).
++ *
++ * File I/O, directories, mutexes etc. come from physfs_platform_posix.c;
++ * this file only provides what physfs_platform_unix.c would otherwise do.
++ *
++ * Paths look like "host:/", "mass:/APPS/VVVVVV/" or "hdd0:/...". ps2sdk sets
++ * the current directory from argv[0] at startup, so the base dir is the
++ * current directory. User data goes to "<base>savedata/".
++ *
++ * Please see the file LICENSE.txt in the source's root directory.
++ */
++
++#define __PHYSICSFS_INTERNAL__
++#include "physfs_platforms.h"
++
++#ifdef PHYSFS_PLATFORM_PS2
++
++#include <unistd.h>
++
++#include "physfs_internal.h"
++
++int __PHYSFS_platformInit(void)
++{
++    return 1;  /* always succeed. */
++}
++
++void __PHYSFS_platformDeinit(void)
++{
++    /* no-op */
++}
++
++void __PHYSFS_platformDetectAvailableCDs(PHYSFS_StringCallback cb, void *data)
++{
++    /* no CD-ROM enumeration; PHYSFS_NO_CDROM_SUPPORT */
++}
++
++char *__PHYSFS_platformCalcBaseDir(const char *argv0)
++{
++    char cwd[1024];
++    size_t len;
++    char *retval;
++
++    if (getcwd(cwd, sizeof(cwd)) == NULL || cwd[0] == '\0')
++    {
++        /* Fall back to the directory part of argv0 ("host:x.elf" -> "host:") */
++        const char *sep = argv0 ? strrchr(argv0, '/') : NULL;
++        if (!sep && argv0)
++            sep = strrchr(argv0, ':');
++        BAIL_IF(!sep, PHYSFS_ERR_ARGV0_IS_NULL, NULL);
++        len = (size_t) (sep - argv0) + 1;
++        retval = (char *) allocator.Malloc(len + 2);
++        BAIL_IF(!retval, PHYSFS_ERR_OUT_OF_MEMORY, NULL);
++        memcpy(retval, argv0, len);
++        retval[len] = '\0';
++    }
++    else
++    {
++        len = strlen(cwd);
++        retval = (char *) allocator.Malloc(len + 2);
++        BAIL_IF(!retval, PHYSFS_ERR_OUT_OF_MEMORY, NULL);
++        memcpy(retval, cwd, len + 1);
++    }
++
++    /* PhysicsFS wants a trailing separator, but not a doubled one ("host://") */
++    len = strlen(retval);
++    if (len == 0 || retval[len - 1] != '/')
++    {
++        retval[len] = '/';
++        retval[len + 1] = '\0';
++    }
++    return retval;
++}
++
++char *__PHYSFS_platformCalcPrefDir(const char *org, const char *app)
++{
++    const char *base = PHYSFS_getBaseDir();
++    const char *sub = "savedata/";
++    char *retval;
++
++    (void) org;
++    (void) app;
++    BAIL_IF(!base, PHYSFS_ERR_OTHER_ERROR, NULL);
++    retval = (char *) allocator.Malloc(strlen(base) + strlen(sub) + 1);
++    BAIL_IF(!retval, PHYSFS_ERR_OUT_OF_MEMORY, NULL);
++    strcpy(retval, base);
++    strcat(retval, sub);
++    return retval;
++}
++
++#endif /* PHYSFS_PLATFORM_PS2 */
++
++/* end of physfs_platform_ps2.c ... */

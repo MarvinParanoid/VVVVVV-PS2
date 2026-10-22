@@ -1,0 +1,169 @@
+--- a/desktop_version/src/Graphics.h
++++ b/desktop_version/src/Graphics.h
+@@ -10,6 +10,15 @@
+ #include "Textbox.h"
+ #include "TowerBG.h"
+ 
++#ifdef __PS2__
++#include "PS2Bench.h"
++/* PS2: render targets in the layout of the loaded textures (ABGR8888), so
++ * blits do not convert between channel orders (docs/ps2-p3-report.md) */
++#define VVV_TARGET_PIXELFORMAT ((ps2_opts & PS2_OPT_TARGET_ABGR) ? SDL_PIXELFORMAT_ABGR8888 : SDL_PIXELFORMAT_ARGB8888)
++#else
++#define VVV_TARGET_PIXELFORMAT SDL_PIXELFORMAT_ARGB8888
++#endif
++
+ enum FadeBars
+ {
+     FADE_NONE,
+@@ -210,6 +219,9 @@
+ 
+     int clear(int r, int g, int b, int a);
+     int clear(void);
++#ifdef __PS2__
++    bool ps2_window_clear_redundant(void);
++#endif
+ 
+     bool substitute(SDL_Texture** texture);
+     void post_substitute(SDL_Texture* subst);
+--- a/desktop_version/src/Graphics.cpp
++++ b/desktop_version/src/Graphics.cpp
+@@ -175,7 +175,7 @@
+ #define CREATE_TEXTURE_WITH_DIMENSIONS(w, h) \
+     SDL_CreateTexture( \
+         gameScreen.m_renderer, \
+-        SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, \
++        VVV_TARGET_PIXELFORMAT, SDL_TEXTUREACCESS_TARGET, \
+         (w), (h) \
+     )
+ #define CREATE_TEXTURE \
+@@ -505,6 +505,25 @@
+     return result;
+ }
+ 
++#ifdef __PS2__
++/* P3: the window is cleared up to three times per frame, but every frame ends
++ * with render() copying the finished frame, without blending, over the whole
++ * window whenever the stretch rectangle is the whole window (always on the
++ * PS2's 320x240 window). */
++bool Graphics::ps2_window_clear_redundant(void)
++{
++    SDL_Rect rect;
++    int w, h;
++    if (!(ps2_opts & PS2_OPT_WINDOW_CLEARS) || SDL_GetRenderTarget(gameScreen.m_renderer) != NULL)
++    {
++        return false;
++    }
++    get_stretch_info(&rect);
++    gameScreen.GetScreenSize(&w, &h);
++    return rect.x == 0 && rect.y == 0 && rect.w == w && rect.h == h;
++}
++#endif
++
+ int Graphics::clear(const int r, const int g, const int b, const int a)
+ {
+     set_color(r, g, b, a);
+@@ -765,11 +784,35 @@
+     const SDL_Rect src = {0, 0, texture_rect.w, texture_rect.h};
+     const SDL_Rect dest = {x, y, texture_rect.w, texture_rect.h};
+ 
++#ifdef __PS2__
++    /* P3: the scrolled textures (tower and warp backgrounds) are built by a
++     * clear() plus blended draws, so every pixel stays opaque and a blended
++     * copy writes exactly the source; without blending it is a plain row
++     * copy instead of a per-pixel alpha test. */
++    SDL_BlendMode texture_blend = SDL_BLENDMODE_NONE, temp_blend = SDL_BLENDMODE_NONE;
++    const bool opaque_copies = (ps2_opts & PS2_OPT_OPAQUE_SCROLL) != 0;
++    if (opaque_copies)
++    {
++        SDL_GetTextureBlendMode(texture, &texture_blend);
++        SDL_GetTextureBlendMode(temp, &temp_blend);
++        set_blendmode(texture, SDL_BLENDMODE_NONE);
++        set_blendmode(temp, SDL_BLENDMODE_NONE);
++    }
++#endif
++
+     set_render_target(temp);
+     clear();
+     copy_texture(texture, &src, &dest);
+     set_render_target(target);
+     copy_texture(temp, &src, &src);
++
++#ifdef __PS2__
++    if (opaque_copies)
++    {
++        set_blendmode(texture, texture_blend);
++        set_blendmode(temp, temp_blend);
++    }
++#endif
+ }
+ 
+ bool Graphics::shouldrecoloroneway(const int tilenum, const bool mounted)
+@@ -2934,6 +2977,9 @@
+ 
+     if (bg_obj.tdrawback)
+     {
++#ifdef __PS2__
++        ps2_tower_full_redraws++;
++#endif
+         int off = bg_obj.scrolldir == 0 ? 0 : bg_obj.bscroll;
+         //Draw the whole thing; needed for every colour cycle!
+         clear();
+--- a/desktop_version/src/Screen.cpp
++++ b/desktop_version/src/Screen.cpp
+@@ -283,6 +283,9 @@
+ void Screen::RenderPresent(void)
+ {
+     SDL_RenderPresent(m_renderer);
++#ifdef __PS2__
++    if (!graphics.ps2_window_clear_redundant())
++#endif
+     graphics.clear();
+ }
+ 
+@@ -312,7 +315,7 @@
+ 
+     graphics.gameTexture = SDL_CreateTexture(
+         m_renderer,
+-        SDL_PIXELFORMAT_ARGB8888,
++        VVV_TARGET_PIXELFORMAT,
+         SDL_TEXTUREACCESS_TARGET,
+         SCREEN_WIDTH_PIXELS,
+         SCREEN_HEIGHT_PIXELS
+@@ -320,7 +323,7 @@
+ 
+     graphics.tempShakeTexture = SDL_CreateTexture(
+         m_renderer,
+-        SDL_PIXELFORMAT_ARGB8888,
++        VVV_TARGET_PIXELFORMAT,
+         SDL_TEXTUREACCESS_TARGET,
+         SCREEN_WIDTH_PIXELS,
+         SCREEN_HEIGHT_PIXELS
+--- a/desktop_version/src/GraphicsResources.cpp
++++ b/desktop_version/src/GraphicsResources.cpp
+@@ -434,7 +434,7 @@
+ 
+     init_translations();
+ 
+-    im_image12 = SDL_CreateTexture(gameScreen.m_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, 240, 180);
++    im_image12 = SDL_CreateTexture(gameScreen.m_renderer, VVV_TARGET_PIXELFORMAT, SDL_TEXTUREACCESS_TARGET, 240, 180);
+ 
+     if (im_image12 == NULL)
+     {
+--- a/desktop_version/src/Game.cpp
++++ b/desktop_version/src/Game.cpp
+@@ -356,7 +356,14 @@
+     fadetolab = false;
+     fadetolabdelay = 0;
+ 
++#ifdef __PS2__
++    /* PS2: render once per 34 ms logic tick by default. Interpolated extra
++     * frames cost a full software render each and only fit in light scenes;
++     * the setting stays available in the options (docs/ps2-p3-report.md). */
++    over30mode = false;
++#else
+     over30mode = true;
++#endif
+     showingametimer = false;
+ 
+     ingame_titlemode = false;

@@ -1,0 +1,82 @@
+name: Hardware test report
+description: Results from running the port on a real PlayStation 2 (success or failure, both help).
+title: "[HW] <console model>: <short result>"
+labels: ["hardware-test"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for testing on real hardware! The checklist in `docs/ps2-hardware-first-boot.md` walks through a full session.
+        **Do not attach `data.zip`, `data-ps2.zip` or any extracted game graphics, sounds or music.**
+  - type: input
+    id: build
+    attributes:
+      label: Build ID
+      description: Shown in the first line of the white start-up list (e.g. `H1-RC2`, or `dev` for a self-built ELF).
+    validations:
+      required: true
+  - type: input
+    id: console
+    attributes:
+      label: Console model and region
+      description: From the sticker on the bottom, e.g. SCPH-75004 (PAL).
+    validations:
+      required: true
+  - type: input
+    id: launcher
+    attributes:
+      label: How it was launched
+      description: e.g. FMCB 1.966 → wLaunchELF 4.43x, from mass:/VVVVVV/
+    validations:
+      required: true
+  - type: input
+    id: usb
+    attributes:
+      label: USB stick
+      description: Brand, model, size, file system (FAT32/exFAT), and which port.
+  - type: input
+    id: display
+    attributes:
+      label: TV and cable
+      description: e.g. CRT via RGB SCART, LCD via component, composite.
+  - type: dropdown
+    id: fs_smoke
+    attributes:
+      label: fs_smoke.elf result
+      options:
+        - ALL OK
+        - PROBLEMS (see attached photo/log)
+        - Did not start / black screen
+        - Not run
+    validations:
+      required: true
+  - type: dropdown
+    id: game
+    attributes:
+      label: How far did VVVVVV.elf get?
+      options:
+        - Played normally
+        - Title screen, but problems in game
+        - Stopped on the start-up list
+        - FATAL ERROR screen
+        - CPU EXCEPTION screen
+        - Black screen / nothing
+        - Not run
+    validations:
+      required: true
+  - type: textarea
+    id: observations
+    attributes:
+      label: What you saw and heard
+      description: |
+        Music and sound (gaps, clicks?), smoothness, overlay values (L3+R3: TPS, FRAME, RND, UNDERRUN, FREE),
+        save/continue, picture edges/colours. For a failure: the last line of the start-up list and what you did just before.
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Logs and photos
+      description: |
+        Drag files here from the game folder on the stick: `fs_smoke.log`, `vvvvvv_ps2.log`, `bench_results.txt` (if you ran the benchmark).
+        Photos of the fs_smoke screen and of any FATAL ERROR / CPU EXCEPTION screen (whole screen, readable).

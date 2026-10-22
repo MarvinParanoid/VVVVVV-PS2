@@ -1,0 +1,1100 @@
+--- a/desktop_version/src/Music.h
++++ b/desktop_version/src/Music.h
+@@ -127,4 +127,25 @@
+ extern musicclass music;
+ #endif
+ 
++#ifdef VVV_MUSIC_STREAMING
++#include <SDL_stdinc.h>
++/* Streaming music statistics (VVV_MUSIC_STREAMING). Written by the stream
++ * worker and the audio thread; read approximately by instrumentation. */
++struct StreamStats
++{
++    Uint32 opens, open_failures, last_open_us, max_open_us;
++    int last_source;
++    Uint32 decode_calls, max_decode_us, max_slice_us;
++    int max_slice_phase;
++    Uint64 decode_us_total, frames_decoded;
++    Uint32 loops, max_loop_seek_us, loop_fill_frames;
++    Uint32 underruns, underrun_frames, priming_buffers, yields;
++    Uint32 min_fill_frames, ring_fill_frames, ring_bytes;
++    int sources;
++    bool active;
++};
++void MUSIC_GetStreamStats(StreamStats* out);
++void MUSIC_ResetStreamMinFill(void);
++#endif
++
+ #endif /* MUSIC_H */
+--- a/desktop_version/src/Music.cpp
++++ b/desktop_version/src/Music.cpp
+@@ -35,14 +35,28 @@
+ 
+ #define pow SDL_pow
+ #define log(x) SDL_log(x)
++#ifdef VVV_MUSIC_STREAMING
++/* stb_vorbis_open spends long stretches in sin/cos (window and twiddle
++ * tables, soft double on the PS2 EE) and qsort without reading the stream;
++ * these are the streaming worker's yield points there (see vvvstream). */
++static void vvvstream_yield_point(void);
++static void vvvstream_qsort(void* base, size_t num, size_t size, int (*compare)(const void*, const void*));
++#define sin(x) (vvvstream_yield_point(), SDL_sin(x))
++#define cos(x) (vvvstream_yield_point(), SDL_cos(x))
++#else
+ #define sin(x) SDL_sin(x)
+ #define cos(x) SDL_cos(x)
++#endif
+ #define floor SDL_floor
+ #define abs(x) SDL_abs(x)
+ #define ldexp(v, e) SDL_scalbn((v), (e))
+ #define exp(x) SDL_exp(x)
+ 
++#ifdef VVV_MUSIC_STREAMING
++#define qsort vvvstream_qsort
++#else
+ #define qsort SDL_qsort
++#endif
+ 
+ #define assert SDL_assert
+ 
+@@ -90,6 +104,662 @@
+ static FAudio* faudioctx = NULL;
+ static FAudioMasteringVoice* masteringvoice = NULL;
+ 
++#ifdef VVV_MUSIC_STREAMING
++/* Streaming music (VVV_MUSIC_STREAMING, enabled for the PS2 build).
++ *
++ * The music blob is never loaded. At init only its header table is read and
++ * every track becomes a {file, offset, size} source. One worker thread owns
++ * the single open stb_vorbis decoder: it opens the track (this costs ~115 ms
++ * of EE time), reads through PhysicsFS and decodes into a bounded float ring
++ * buffer. FAudio's buffer callbacks (SDL audio thread) only copy out of the
++ * ring, so neither file I/O nor decoding runs on the game thread or blocks
++ * sound effects.
++ *
++ * Scheduling: the EE scheduler is strictly priority based and the game thread
++ * rarely sleeps (a frame that misses vsync skips the vsync wait), so a worker
++ * below the game thread starves (a track open took 12.8 s in PCSX2). The
++ * worker therefore runs above the game thread but cooperatively: after every
++ * ~2 ms of work it sleeps for 1 ms, so the game thread is never held off for
++ * long. Inside stb_vorbis the checks run from its read callback and from its
++ * sin/cos/qsort calls (the window/twiddle tables of a track open would
++ * otherwise hold the CPU for ~105 ms in one piece).
++ *
++ * Seeking must be cheap, so the blob has to be a STORED zip entry or a plain
++ * file (scripts/repack-data-zip.py); a deflated entry is detected at init and
++ * music is disabled with a diagnostic instead of stalling for seconds. */
++#include <physfs.h>
++
++namespace vvvstream
++{
++
++struct Source
++{
++    char path[64];
++    Sint64 offset;
++    Sint64 size;
++    int channels;
++    int rate;
++};
++static std::vector<Source> sources;
++
++/* Ring: 1 s of float stereo at 44.1 kHz (~345 KiB). */
++#define VVVSTREAM_RING_FRAMES 44100
++#define VVVSTREAM_CHUNK_FRAMES 1024
++/* work/sleep duty cycle: decoding needs ~9% of the EE, so 2 ms on / 1 ms off
++ * refills the ring fast; a track open (~130 ms of CPU, music not yet
++ * audible) gets 1 ms on / 2 ms off so the game keeps ~2/3 of the CPU */
++#define VVVSTREAM_SLICE_US 2000
++#define VVVSTREAM_OPEN_SLICE_US 1000
++#define VVVSTREAM_OPEN_SLEEP_MS 2
++/* decoded frames needed before a new track is handed to the audio thread;
++ * until then it plays silence ("priming") instead of underrunning */
++#define VVVSTREAM_PREROLL_FRAMES 4096
++static float* ring = NULL;
++/* the two 50 ms FAudio buffers of the music voice; shared by all streamed
++ * tracks since only one music voice exists at a time */
++static Uint8* voice_buf[2] = {NULL, NULL};
++static Uint32 voice_buf_size = 0;
++static SDL_atomic_t wpos; /* frames written (monotonic, wraps at 2^32) */
++static SDL_atomic_t rpos; /* frames read */
++static SDL_atomic_t ready_gen; /* generation whose data the ring holds; 0 = none */
++static SDL_atomic_t eof_gen;   /* generation that reached its non-looping end */
++static int ring_channels = 2;
++
++static SDL_Thread* thread = NULL;
++static SDL_mutex* lock = NULL;
++static SDL_sem* wake = NULL;
++static int cmd_source = -1;
++static bool cmd_loop = false;
++static int cmd_gen = 0;
++static bool cmd_pending = false;
++static bool cmd_quit = false;
++static int next_gen = 1;
++
++static StreamStats stats;
++
++static Uint32 ring_fill(void)
++{
++    return (Uint32) SDL_AtomicGet(&wpos) - (Uint32) SDL_AtomicGet(&rpos);
++}
++
++/* Find the compression method of `entry` in the zip at real path `archive`
++ * by reading its central directory. -1 if it cannot be determined. */
++static int zip_entry_method(const char* archive, const char* entry)
++{
++    SDL_RWops* rw = SDL_RWFromFile(archive, "rb");
++    Sint64 size, tail_start;
++    Uint8* tail;
++    int method = -1;
++    size_t tail_len, i, name_len = SDL_strlen(entry);
++
++    if (rw == NULL)
++    {
++        return -1;
++    }
++    size = SDL_RWsize(rw);
++    tail_len = (size_t) SDL_min(size, (Sint64) (65535 + 22));
++    tail_start = size - (Sint64) tail_len;
++    tail = (Uint8*) SDL_malloc(tail_len);
++    if (tail != NULL && SDL_RWseek(rw, tail_start, RW_SEEK_SET) >= 0
++    && SDL_RWread(rw, tail, 1, tail_len) == tail_len)
++    {
++        for (i = tail_len - 22 + 1; i-- > 0;)
++        {
++            Uint32 eocd_sig;
++            SDL_memcpy(&eocd_sig, tail + i, 4);
++            if (SDL_SwapLE32(eocd_sig) == 0x06054b50) /* end of central directory */
++            {
++                Uint32 cd_size, cd_offset, sig;
++                Uint16 entries, n;
++                SDL_memcpy(&entries, tail + i + 10, 2);
++                SDL_memcpy(&cd_size, tail + i + 12, 4);
++                SDL_memcpy(&cd_offset, tail + i + 16, 4);
++                entries = SDL_SwapLE16(entries);
++                cd_size = SDL_SwapLE32(cd_size);
++                cd_offset = SDL_SwapLE32(cd_offset);
++                Uint8* cd = (Uint8*) SDL_malloc(cd_size);
++                if (cd != NULL && SDL_RWseek(rw, cd_offset, RW_SEEK_SET) >= 0
++                && SDL_RWread(rw, cd, 1, cd_size) == cd_size)
++                {
++                    Uint32 at = 0;
++                    for (n = 0; n < entries && at + 46 <= cd_size; n++)
++                    {
++                        Uint16 m, fn_len, extra_len, comment_len;
++                        SDL_memcpy(&sig, cd + at, 4);
++                        if (SDL_SwapLE32(sig) != 0x02014b50)
++                        {
++                            break;
++                        }
++                        SDL_memcpy(&m, cd + at + 10, 2);
++                        SDL_memcpy(&fn_len, cd + at + 28, 2);
++                        SDL_memcpy(&extra_len, cd + at + 30, 2);
++                        SDL_memcpy(&comment_len, cd + at + 32, 2);
++                        fn_len = SDL_SwapLE16(fn_len);
++                        if (fn_len == name_len && at + 46 + fn_len <= cd_size
++                        && SDL_memcmp(cd + at + 46, entry, name_len) == 0)
++                        {
++                            method = SDL_SwapLE16(m);
++                            break;
++                        }
++                        at += 46 + fn_len + SDL_SwapLE16(extra_len) + SDL_SwapLE16(comment_len);
++                    }
++                }
++                SDL_free(cd);
++                break;
++            }
++        }
++    }
++    SDL_free(tail);
++    SDL_RWclose(rw);
++    return method;
++}
++
++/* Is `file` (a PhysFS path) seekable cheaply? Plain files are; zip entries
++ * only if STORED. Logs the reason when it is not. */
++static bool seekable(const char* file)
++{
++    const char* real = PHYSFS_getRealDir(file);
++    int method;
++
++    if (real == NULL)
++    {
++        return false;
++    }
++    if (SDL_strlen(real) < 4 || SDL_strcasecmp(real + SDL_strlen(real) - 4, ".zip") != 0)
++    {
++        return true; /* a mounted directory: plain file */
++    }
++    method = zip_entry_method(real, file);
++    if (method == 0)
++    {
++        vlog_info("Music: %s is stored uncompressed in %s; streaming enabled", file, real);
++        return true;
++    }
++    if (method < 0)
++    {
++        vlog_warn("Music: could not read the compression method of %s in %s; trying to stream anyway", file, real);
++        return true;
++    }
++    vlog_error("Music: %s is compressed (zip method %d) in %s.", file, method, real);
++    vlog_error("Music: streaming would need seconds per track start; music is DISABLED.");
++    vlog_error("Music: create a PS2 archive with: scripts/repack-data-zip.py data.zip data-ps2.zip");
++    return false;
++}
++
++/* Read the Vorbis identification header at the start of a track. */
++static bool probe(Source* src)
++{
++    Uint8 buf[128];
++    PHYSFS_File* f = PHYSFS_openRead(src->path);
++    PHYSFS_sint64 n;
++    size_t i;
++
++    if (f == NULL)
++    {
++        return false;
++    }
++    n = (PHYSFS_seek(f, (PHYSFS_uint64) src->offset) != 0)
++        ? PHYSFS_readBytes(f, buf, (PHYSFS_uint64) SDL_min(src->size, (Sint64) sizeof(buf)))
++        : -1;
++    PHYSFS_close(f);
++    for (i = 0; n > 0 && i + 16 <= (size_t) n; i++)
++    {
++        if (buf[i] == 0x01 && SDL_memcmp(buf + i + 1, "vorbis", 6) == 0)
++        {
++            Uint32 rate;
++            src->channels = buf[i + 11];
++            SDL_memcpy(&rate, buf + i + 12, 4);
++            src->rate = (int) SDL_SwapLE32(rate);
++            return src->channels >= 1 && src->channels <= 2 && src->rate > 0;
++        }
++    }
++    return false;
++}
++
++/* Index a blob: name -> {offset,size}, mirroring FILESYSTEM_loadBinaryBlob's
++ * walk (header table, then the data of every valid entry in order). Only the
++ * 7.5 KiB header table is read. */
++struct BlobEntry
++{
++    char name[48];
++    Sint64 offset;
++    Sint64 size;
++};
++static bool index_blob(const char* file, std::vector<BlobEntry>* out)
++{
++    static resourceheader headers[binaryBlob::max_headers];
++    PHYSFS_File* f;
++    Sint64 offset = sizeof(headers), length;
++    int i;
++
++    out->clear();
++    if (!PHYSFS_exists(file))
++    {
++        return false;
++    }
++    f = PHYSFS_openRead(file);
++    if (f == NULL)
++    {
++        vlog_error("Music: cannot open %s: %s", file, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
++        return false;
++    }
++    length = PHYSFS_fileLength(f);
++    if (PHYSFS_readBytes(f, headers, sizeof(headers)) != (PHYSFS_sint64) sizeof(headers))
++    {
++        vlog_error("Music: %s is too short for a blob header table", file);
++        PHYSFS_close(f);
++        return false;
++    }
++    PHYSFS_close(f);
++    for (i = 0; i < binaryBlob::max_headers; i++)
++    {
++        BlobEntry e;
++        const resourceheader* h = &headers[i];
++        if (h->valid != 1 || h->size < 1)
++        {
++            continue; /* same rule as FILESYSTEM_loadBinaryBlob: skip, no offset advance */
++        }
++        SDL_memcpy(e.name, h->name, sizeof(e.name));
++        e.name[sizeof(e.name) - 1] = '\0';
++        e.offset = offset;
++        e.size = SDL_min((Sint64) h->size, length - offset);
++        offset += h->size;
++        if (e.size > 0)
++        {
++            out->push_back(e);
++        }
++    }
++    vlog_info("Music: indexed %s: %d entries, %lld bytes (header table only read)",
++        file, (int) out->size(), (long long) length);
++    return !out->empty();
++}
++
++/* Returns the new source index, or -1. */
++static int add_source(const char* path, Sint64 offset, Sint64 size)
++{
++    Source s;
++    SDL_zero(s);
++    SDL_strlcpy(s.path, path, sizeof(s.path));
++    s.offset = offset;
++    s.size = size;
++    if (!probe(&s))
++    {
++        vlog_error("Music: %s @%lld is not a playable Ogg Vorbis stream", path, (long long) offset);
++        return -1;
++    }
++    sources.push_back(s);
++    return (int) sources.size() - 1;
++}
++
++static stb_vorbis* open_source(int index, int* channels, int* loopbegin, int* looplength);
++
++/* Cooperative time slicing (worker thread only). */
++static Uint64 slice_start;
++static Uint64 slice_ticks;
++static Uint32 slice_sleep_ms = 1;
++static volatile bool in_stb = false; /* worker is inside stb_vorbis: arms the yield points */
++static int slice_phase; /* 0 idle/loop, 1 close, 2 open, 3 decode, 4 loop seek */
++
++static void begin_slice(void)
++{
++    slice_start = SDL_GetPerformanceCounter();
++}
++
++static void yield_if_slice_used(void)
++{
++    const Uint64 used = SDL_GetPerformanceCounter() - slice_start;
++    if (used >= slice_ticks)
++    {
++        const Uint32 us = (Uint32) (used * 1000000 / SDL_GetPerformanceFrequency());
++        if (us > stats.max_slice_us)
++        {
++            stats.max_slice_us = us;
++            stats.max_slice_phase = slice_phase;
++        }
++        stats.yields++;
++        SDL_Delay(slice_sleep_ms);
++        begin_slice();
++    }
++}
++
++/* stb_vorbis reads the stream mostly a byte at a time, so the read callback
++ * is the one place that runs regularly inside a long stb_vorbis_open. */
++static size_t (SDLCALL* physfs_read)(SDL_RWops*, void*, size_t, size_t);
++
++static size_t SDLCALL yielding_read(SDL_RWops* rw, void* ptr, size_t size, size_t maxnum)
++{
++    static Uint32 calls = 0;
++    if ((++calls & 63) == 0)
++    {
++        yield_if_slice_used();
++    }
++    return physfs_read(rw, ptr, size, maxnum);
++}
++
++static int SDLCALL worker(void* unused)
++{
++    stb_vorbis* vorbis = NULL;
++    int gen = 0, channels = 2, loopbegin = 0, looplength = 0;
++    bool loop = false, at_end = false, published = true;
++    Sint64 sample_pos = 0;
++    UNUSED(unused);
++
++    /* above the game thread (64 on PS2); see the scheduling note above */
++    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_NORMAL);
++    slice_ticks = SDL_GetPerformanceFrequency() * VVVSTREAM_SLICE_US / 1000000;
++    begin_slice();
++    for (;;)
++    {
++        bool pending, quit, did_work = false;
++        int source = -1, g = 0;
++        bool l = false;
++
++        SDL_LockMutex(lock);
++        quit = cmd_quit;
++        pending = cmd_pending;
++        if (pending)
++        {
++            source = cmd_source;
++            g = cmd_gen;
++            l = cmd_loop;
++            cmd_pending = false;
++        }
++        SDL_UnlockMutex(lock);
++        if (quit)
++        {
++            break;
++        }
++
++        if (pending)
++        {
++            /* close the previous track first: one decoder at a time */
++            SDL_AtomicSet(&ready_gen, 0);
++            slice_phase = 1;
++            VVV_freefunc(stb_vorbis_close, vorbis);
++            at_end = false;
++            gen = g;
++            loop = l;
++            if (source >= 0)
++            {
++                Uint64 t0 = SDL_GetPerformanceCounter();
++                slice_phase = 2;
++                const Uint64 decode_slice = slice_ticks;
++                slice_ticks = SDL_GetPerformanceFrequency() * VVVSTREAM_OPEN_SLICE_US / 1000000;
++                slice_sleep_ms = VVVSTREAM_OPEN_SLEEP_MS;
++                in_stb = true;
++                vorbis = open_source(source, &channels, &loopbegin, &looplength);
++                in_stb = false;
++                slice_ticks = decode_slice;
++                slice_sleep_ms = 1;
++                Uint32 us = (Uint32) ((SDL_GetPerformanceCounter() - t0) * 1000000 / SDL_GetPerformanceFrequency());
++                stats.opens++;
++                stats.last_open_us = us;
++                if (us > stats.max_open_us)
++                {
++                    stats.max_open_us = us;
++                }
++                stats.last_source = source;
++                if (vorbis != NULL)
++                {
++                    ring_channels = channels;
++                    sample_pos = 0;
++                    SDL_AtomicSet(&rpos, 0);
++                    SDL_AtomicSet(&wpos, 0);
++                    SDL_AtomicSet(&eof_gen, 0);
++                    published = false;
++                }
++                else
++                {
++                    stats.open_failures++;
++                }
++            }
++            did_work = true;
++        }
++
++        if (vorbis != NULL && !at_end)
++        {
++            const Uint32 space = VVVSTREAM_RING_FRAMES - ring_fill();
++            if (space >= VVVSTREAM_CHUNK_FRAMES)
++            {
++                const Uint32 w = (Uint32) SDL_AtomicGet(&wpos);
++                const Uint32 at = w % VVVSTREAM_RING_FRAMES;
++                Uint32 frames = SDL_min((Uint32) VVVSTREAM_CHUNK_FRAMES, VVVSTREAM_RING_FRAMES - at);
++                Uint64 t0 = SDL_GetPerformanceCounter();
++                int n;
++                if (looplength > 0)
++                {
++                    frames = (Uint32) SDL_min((Sint64) frames, (Sint64) (loopbegin + looplength) - sample_pos);
++                }
++                slice_phase = 3;
++                in_stb = true;
++                n = frames > 0 ? stb_vorbis_get_samples_float_interleaved(
++                    vorbis, ring_channels, ring + (size_t) at * ring_channels, (int) frames * ring_channels
++                ) : 0;
++                in_stb = false;
++                Uint32 us = (Uint32) ((SDL_GetPerformanceCounter() - t0) * 1000000 / SDL_GetPerformanceFrequency());
++                stats.decode_calls++;
++                stats.decode_us_total += us;
++                if (us > stats.max_decode_us)
++                {
++                    stats.max_decode_us = us;
++                }
++                if (n > 0)
++                {
++                    sample_pos += n;
++                    SDL_MemoryBarrierRelease();
++                    SDL_AtomicSet(&wpos, (int) (w + (Uint32) n));
++                    stats.frames_decoded += n;
++                }
++                else if (loop)
++                {
++                    /* end of track or of its loop region: whole-track loops
++                     * seek to the first audio page, no reopen */
++                    Uint64 s0 = SDL_GetPerformanceCounter();
++                    int ok;
++                    slice_phase = 4;
++                    in_stb = true;
++                    ok = (looplength > 0 || loopbegin > 0)
++                        ? stb_vorbis_seek(vorbis, (unsigned int) loopbegin)
++                        : stb_vorbis_seek_start(vorbis);
++                    in_stb = false;
++                    Uint32 sus = (Uint32) ((SDL_GetPerformanceCounter() - s0) * 1000000 / SDL_GetPerformanceFrequency());
++                    sample_pos = loopbegin;
++                    stats.loops++;
++                    stats.loop_fill_frames = ring_fill();
++                    if (sus > stats.max_loop_seek_us)
++                    {
++                        stats.max_loop_seek_us = sus;
++                    }
++                    if (!ok)
++                    {
++                        vlog_error("Music: loop seek failed; stopping track");
++                        at_end = true;
++                        SDL_AtomicSet(&eof_gen, gen);
++                    }
++                }
++                else
++                {
++                    at_end = true;
++                    SDL_AtomicSet(&eof_gen, gen);
++                }
++                did_work = true;
++            }
++        }
++
++        if (!published && vorbis != NULL && (at_end || ring_fill() >= VVVSTREAM_PREROLL_FRAMES))
++        {
++            SDL_MemoryBarrierRelease();
++            SDL_AtomicSet(&ready_gen, gen);
++            published = true;
++        }
++
++        if (did_work)
++        {
++            yield_if_slice_used();
++        }
++        else
++        {
++            const Uint32 us = (Uint32) ((SDL_GetPerformanceCounter() - slice_start) * 1000000 / SDL_GetPerformanceFrequency());
++            if (us > stats.max_slice_us)
++            {
++                stats.max_slice_us = us;
++                stats.max_slice_phase = slice_phase;
++            }
++            SDL_SemWaitTimeout(wake, 20);
++            begin_slice();
++        }
++    }
++    VVV_freefunc(stb_vorbis_close, vorbis);
++    return 0;
++}
++
++static bool start(void)
++{
++    ring = (float*) SDL_malloc(sizeof(float) * 2 * VVVSTREAM_RING_FRAMES);
++    lock = SDL_CreateMutex();
++    wake = SDL_CreateSemaphore(0);
++    if (ring == NULL || lock == NULL || wake == NULL)
++    {
++        vlog_error("Music: cannot allocate the streaming ring/thread objects");
++        return false;
++    }
++    SDL_AtomicSet(&ready_gen, 0);
++    thread = SDL_CreateThread(worker, "vvvvvv_music", NULL);
++    if (thread == NULL)
++    {
++        vlog_error("Music: cannot start the streaming thread: %s", SDL_GetError());
++        return false;
++    }
++    stats.ring_bytes = sizeof(float) * 2 * VVVSTREAM_RING_FRAMES;
++    return true;
++}
++
++static void stop_thread(void)
++{
++    if (thread != NULL)
++    {
++        SDL_LockMutex(lock);
++        cmd_quit = true;
++        SDL_UnlockMutex(lock);
++        SDL_SemPost(wake);
++        SDL_WaitThread(thread, NULL);
++        thread = NULL;
++    }
++    VVV_freefunc(SDL_DestroySemaphore, wake);
++    VVV_freefunc(SDL_DestroyMutex, lock);
++    VVV_free(ring);
++    VVV_free(voice_buf[0]);
++    VVV_free(voice_buf[1]);
++    voice_buf_size = 0;
++    sources.clear();
++}
++
++/* Main thread: request a track (source >= 0) or silence (-1). Returns the
++ * generation the consumer must match. Latest request wins. */
++static int request(int source, bool loop)
++{
++    int gen;
++    if (lock == NULL)
++    {
++        return 0;
++    }
++    SDL_LockMutex(lock);
++    gen = next_gen++;
++    if (next_gen <= 0)
++    {
++        next_gen = 1;
++    }
++    cmd_source = source;
++    cmd_loop = loop;
++    cmd_gen = gen;
++    cmd_pending = true;
++    SDL_UnlockMutex(lock);
++    SDL_SemPost(wake);
++    return gen;
++}
++
++/* Audio thread: copy up to `frames` frames for generation `gen`. Returns the
++ * number of frames produced; 0 means the (non-looping) track has ended. While
++ * the track is still opening, or on an underrun, silence is produced so the
++ * voice keeps running. */
++static Uint32 consume(float* out, Uint32 frames, int channels, int gen)
++{
++    Uint32 got = 0;
++    if (SDL_AtomicGet(&ready_gen) != gen || ring_channels != channels)
++    {
++        SDL_memset(out, 0, sizeof(float) * frames * channels);
++        stats.priming_buffers++;
++        return frames;
++    }
++    SDL_MemoryBarrierAcquire();
++    {
++        const Uint32 r = (Uint32) SDL_AtomicGet(&rpos);
++        const Uint32 avail = (Uint32) SDL_AtomicGet(&wpos) - r;
++        got = SDL_min(avail, frames);
++        if (got > 0)
++        {
++            const Uint32 at = r % VVVSTREAM_RING_FRAMES;
++            const Uint32 first = SDL_min(got, VVVSTREAM_RING_FRAMES - at);
++            SDL_memcpy(out, ring + (size_t) at * channels, sizeof(float) * first * channels);
++            if (got > first)
++            {
++                SDL_memcpy(out + (size_t) first * channels, ring, sizeof(float) * (got - first) * channels);
++            }
++            SDL_AtomicSet(&rpos, (int) (r + got));
++        }
++        if (avail - got < stats.min_fill_frames || stats.min_fill_frames == 0)
++        {
++            stats.min_fill_frames = avail - got + 1; /* +1: 0 means "not set" */
++        }
++    }
++    SDL_SemPost(wake);
++    if (got < frames)
++    {
++        if (SDL_AtomicGet(&eof_gen) == gen)
++        {
++            return got; /* end of a non-looping track */
++        }
++        SDL_memset(out + (size_t) got * channels, 0, sizeof(float) * (frames - got) * channels);
++        stats.underruns++;
++        stats.underrun_frames += frames - got;
++        return frames;
++    }
++    return frames;
++}
++
++} /* namespace vvvstream */
++
++static void vvvstream_yield_point(void)
++{
++    static Uint32 calls = 0;
++    if ((++calls & 15) == 0 && vvvstream::in_stb)
++    {
++        vvvstream::yield_if_slice_used();
++    }
++}
++
++static void vvvstream_qsort(void* base, size_t num, size_t size, int (*compare)(const void*, const void*))
++{
++    vvvstream_yield_point();
++    SDL_qsort(base, num, size, compare);
++    vvvstream_yield_point();
++}
++
++void MUSIC_GetStreamStats(StreamStats* out)
++{
++    *out = vvvstream::stats;
++    out->ring_fill_frames = vvvstream::thread != NULL ? vvvstream::ring_fill() : 0;
++    out->min_fill_frames = vvvstream::stats.min_fill_frames > 0 ? vvvstream::stats.min_fill_frames - 1 : 0;
++    out->sources = (int) vvvstream::sources.size();
++    out->active = SDL_AtomicGet(&vvvstream::ready_gen) != 0;
++}
++
++void MUSIC_ResetStreamMinFill(void)
++{
++    vvvstream::stats.min_fill_frames = 0;
++}
++#endif /* VVV_MUSIC_STREAMING */
++
+ class SoundTrack
+ {
+ public:
+@@ -372,9 +1042,47 @@
+ class MusicTrack
+ {
+ public:
++#ifdef VVV_MUSIC_STREAMING
++    MusicTrack(void)
++    {
++        SDL_zerop(this);
++        stream_index = -1;
++    }
++
++    /* Streaming track: format comes from the source's identification header;
++     * the decoder is opened by the stream worker when the track is played. */
++    MusicTrack(int source_index, int source_channels, int source_rate)
++    {
++        SDL_zerop(this);
++        stream_index = source_index;
++        format.wFormatTag = FAUDIO_FORMAT_IEEE_FLOAT;
++        format.wBitsPerSample = sizeof(float) * 8;
++        format.nChannels = source_channels;
++        format.nSamplesPerSec = source_rate;
++        format.nBlockAlign = format.nChannels * (format.wBitsPerSample / 8);
++        format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
++        channels = format.nChannels;
++        size = format.nAvgBytesPerSec / 20;
++        valid = true; /* buffers: vvvstream::voice_buf, attached in Play() */
++    }
++
++    static void parseLoopComments(stb_vorbis* vorbis, int rate, int* begin, int* length)
++    {
++        MusicTrack t;
++        stb_vorbis_comment comment = stb_vorbis_get_comment(vorbis);
++        t.format.nSamplesPerSec = rate;
++        parseComments(&t, comment.comment_list, comment.comment_list_length);
++        *begin = t.loopbegin;
++        *length = t.looplength;
++    }
++#endif
++
+     MusicTrack(SDL_RWops *rw)
+     {
+         SDL_zerop(this);
++#ifdef VVV_MUSIC_STREAMING
++        stream_index = -1;
++#endif
+         read_buf = (Uint8*) SDL_malloc(rw->size(rw));
+         SDL_RWread(rw, read_buf, rw->size(rw), 1);
+         int err;
+@@ -414,6 +1122,14 @@
+ 
+     void Dispose(void)
+     {
++#ifdef VVV_MUSIC_STREAMING
++        if (stream_index >= 0)
++        {
++            /* shared buffers, freed by vvvstream::stop_thread() */
++            decoded_buf_playing = NULL;
++            decoded_buf_reserve = NULL;
++        }
++#endif
+         VVV_freefunc(stb_vorbis_close, vorbis);
+         VVV_free(read_buf);
+         VVV_free(decoded_buf_playing);
+@@ -431,6 +1147,59 @@
+             return false;
+         }
+ 
++#ifdef VVV_MUSIC_STREAMING
++        if (stream_index >= 0)
++        {
++            /* Nothing heavy here: the worker opens and decodes the track.
++             * The voice starts at once and plays silence until data arrives,
++             * so halted()/fade bookkeeping behaves exactly as before. */
++            Halt();
++            /* the previous voice is gone, so the shared buffers are free */
++            if (vvvstream::voice_buf_size < size)
++            {
++                VVV_free(vvvstream::voice_buf[0]);
++                VVV_free(vvvstream::voice_buf[1]);
++                vvvstream::voice_buf[0] = (Uint8*) SDL_malloc(size);
++                vvvstream::voice_buf[1] = (Uint8*) SDL_malloc(size);
++                if (vvvstream::voice_buf[0] == NULL || vvvstream::voice_buf[1] == NULL)
++                {
++                    VVV_free(vvvstream::voice_buf[0]);
++                    VVV_free(vvvstream::voice_buf[1]);
++                    vvvstream::voice_buf_size = 0;
++                    vlog_error("Music: cannot allocate the voice buffers");
++                    return false;
++                }
++                vvvstream::voice_buf_size = size;
++            }
++            decoded_buf_playing = vvvstream::voice_buf[0];
++            decoded_buf_reserve = vvvstream::voice_buf[1];
++            shouldloop = loop;
++            stream_gen = vvvstream::request(stream_index, loop);
++
++            SDL_zero(callbacks);
++            callbacks.OnBufferStart = &MusicTrack::refillReserve;
++            callbacks.OnBufferEnd = &MusicTrack::swapBuffers;
++            if (FAudio_CreateSourceVoice(faudioctx, &musicVoice, &format, 0, 2.0f, &callbacks, NULL, NULL))
++            {
++                vlog_error("Unable to create music voice");
++                return false;
++            }
++            FAudioBuffer faudio_buffer;
++            SDL_zero(faudio_buffer);
++            faudio_buffer.PlayLength = vvvstream::consume((float*) decoded_buf_playing, size / format.nBlockAlign, channels, stream_gen);
++            faudio_buffer.AudioBytes = size;
++            faudio_buffer.pAudioData = decoded_buf_playing;
++            faudio_buffer.pContext = this;
++            if (FAudioSourceVoice_SubmitSourceBuffer(musicVoice, &faudio_buffer, NULL))
++            {
++                vlog_error("Unable to queue sound buffer");
++                return false;
++            }
++            Resume();
++            return true;
++        }
++#endif
++
+         shouldloop = loop;
+         sample_pos = 0;
+         stb_vorbis_seek_start(vorbis);
+@@ -473,6 +1242,10 @@
+             FAudioSourceVoice_FlushSourceBuffers(musicVoice);
+             VVV_freefunc(FAudioVoice_DestroyVoice, musicVoice);
+             paused = true;
++#ifdef VVV_MUSIC_STREAMING
++            /* the voice is gone (no more callbacks): free the decoder too */
++            vvvstream::request(-1, false);
++#endif
+         }
+     }
+ 
+@@ -528,6 +1301,10 @@
+     Uint8* read_buf;
+     bool shouldloop;
+     bool valid;
++#ifdef VVV_MUSIC_STREAMING
++    int stream_index; /* -1: classic in-memory track */
++    int stream_gen;
++#endif
+ 
+     static bool paused;
+     static FAudioSourceVoice* musicVoice;
+@@ -538,6 +1315,22 @@
+         FAudioBuffer faudio_buffer;
+         SDL_zero(faudio_buffer);
+         UNUSED(callback);
++#ifdef VVV_MUSIC_STREAMING
++        if (t->stream_index >= 0)
++        {
++            /* copy only: decoding happens on the stream worker */
++            faudio_buffer.PlayLength = vvvstream::consume((float*) t->decoded_buf_reserve, t->size / t->format.nBlockAlign, t->channels, t->stream_gen);
++            if (faudio_buffer.PlayLength == 0)
++            {
++                return; /* non-looping track finished */
++            }
++            faudio_buffer.AudioBytes = t->size;
++            faudio_buffer.pAudioData = t->decoded_buf_reserve;
++            faudio_buffer.pContext = t;
++            FAudioSourceVoice_SubmitSourceBuffer(musicVoice, &faudio_buffer, NULL);
++            return;
++        }
++#endif
+         if (t->looplength == 0)
+         {
+             faudio_buffer.PlayLength = stb_vorbis_get_samples_float_interleaved(t->vorbis, t->channels, (float*) t->decoded_buf_reserve, t->size / sizeof(float));
+@@ -707,6 +1500,53 @@
+         return (result * 60 + val) * samplerate_hz;
+     }
+ };
++#ifdef VVV_MUSIC_STREAMING
++namespace vvvstream
++{
++static stb_vorbis* open_source(int index, int* channels, int* loopbegin, int* looplength)
++{
++    const Source* src = &sources[index];
++    PHYSFS_File* f = PHYSFS_openRead(src->path);
++    SDL_RWops* rw;
++    stb_vorbis* vorbis;
++    stb_vorbis_info info;
++    int err = 0;
++
++    if (f == NULL)
++    {
++        vlog_error("Music: cannot open %s: %s", src->path, PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
++        return NULL;
++    }
++    PHYSFS_setBuffer(f, 32768);
++    if (!PHYSFS_seek(f, (PHYSFS_uint64) src->offset))
++    {
++        vlog_error("Music: cannot seek %s to %lld", src->path, (long long) src->offset);
++        PHYSFS_close(f);
++        return NULL;
++    }
++    rw = PHYSFSRWOPS_makeRWops(f);
++    if (rw == NULL)
++    {
++        PHYSFS_close(f);
++        return NULL;
++    }
++    physfs_read = rw->read;
++    rw->read = yielding_read;
++    /* close_on_free: stb_vorbis closes rw (and the PhysFS handle), also on failure */
++    vorbis = stb_vorbis_open_file_section(rw, 1, &err, NULL, (unsigned int) src->size);
++    if (vorbis == NULL)
++    {
++        vlog_error("Music: Vorbis open failed for source %d (error %d)", index, err);
++        return NULL;
++    }
++    info = stb_vorbis_get_info(vorbis);
++    *channels = info.channels;
++    MusicTrack::parseLoopComments(vorbis, info.sample_rate, loopbegin, looplength);
++    return vorbis;
++}
++} /* namespace vvvstream */
++#endif
++
+ bool MusicTrack::paused = false;
+ FAudioSourceVoice* MusicTrack::musicVoice = NULL;
+ 
+@@ -773,6 +1613,145 @@
+     soundTracks.push_back(SoundTrack( "sounds/trophy.wav" ));
+     soundTracks.push_back(SoundTrack( "sounds/rescue.wav" ));
+ 
++#ifdef VVV_PS2_NO_MUSIC
++    /* PS2: vvvvvvmusic.vvv is ~62 MB and is held in RAM in full (plus a copy
++     * per track), which cannot fit in 32 MB. Sound effects stay enabled; the
++     * music path needs a streaming loader before it can be turned on. */
++    num_mmmmmm_tracks = 0;
++    num_pppppp_tracks = 0;
++    vlog_info("Music disabled on this platform (VVV_PS2_NO_MUSIC)");
++    return;
++#endif
++
++#ifdef VVV_MUSIC_STREAMING
++    /* Same track numbering as the in-memory path below (MMMMMM tracks first,
++     * then PPPPPP, then extras / loose files), but every track is only an
++     * {archive, offset, size} source; nothing is loaded. */
++    {
++        num_mmmmmm_tracks = 0;
++        num_pppppp_tracks = 0;
++        mmmmmm = false;
++        usingmmmmmm = false;
++        if (!vvvstream::start())
++        {
++            vlog_error("Music: streaming unavailable, continuing without music");
++            return;
++        }
++
++        std::vector<vvvstream::BlobEntry> mmm, ppp;
++        const bool have_mmm = vvvstream::index_blob("mmmmmm.vvv", &mmm) && vvvstream::seekable("mmmmmm.vvv");
++        const bool have_ppp = vvvstream::index_blob("vvvvvvmusic.vvv", &ppp) && vvvstream::seekable("vvvvvvmusic.vvv");
++        const char* names[] = {
++#define FOREACH_TRACK(_, track_name) "data/" track_name,
++            TRACK_NAMES(_)
++#undef FOREACH_TRACK
++        };
++        const size_t num_names = SDL_arraysize(names);
++
++        struct Local
++        {
++            static void add_named(const char* file, const std::vector<vvvstream::BlobEntry>& entries, const char* name)
++            {
++                for (size_t i = 0; i < entries.size(); i++)
++                {
++                    if (SDL_strcmp(entries[i].name, name) == 0)
++                    {
++                        const int src = vvvstream::add_source(file, entries[i].offset, entries[i].size);
++                        if (src >= 0)
++                        {
++                            musicTracks.push_back(MusicTrack(src, vvvstream::sources[src].channels, vvvstream::sources[src].rate));
++                        }
++                        return;
++                    }
++                }
++            }
++            static int add_extras(const char* file, const std::vector<vvvstream::BlobEntry>& entries, const char* const* known, size_t num_known)
++            {
++                int added = 0;
++                for (size_t i = 0; i < entries.size(); i++)
++                {
++                    bool is_known = false;
++                    for (size_t k = 0; k < num_known; k++)
++                    {
++                        is_known = is_known || SDL_strcmp(entries[i].name, known[k]) == 0;
++                    }
++                    if (!is_known)
++                    {
++                        const int src = vvvstream::add_source(file, entries[i].offset, entries[i].size);
++                        if (src >= 0)
++                        {
++                            musicTracks.push_back(MusicTrack(src, vvvstream::sources[src].channels, vvvstream::sources[src].rate));
++                            added++;
++                        }
++                    }
++                }
++                return added;
++            }
++        };
++
++        if (have_mmm)
++        {
++            vlog_info("Music: streaming PPPPPP and MMMMMM blobs...");
++            mmmmmm = true;
++            for (size_t i = 0; i < num_names; i++)
++            {
++                Local::add_named("mmmmmm.vvv", mmm, names[i]);
++            }
++            num_mmmmmm_tracks = (int) musicTracks.size();
++            num_mmmmmm_tracks += Local::add_extras("mmmmmm.vvv", mmm, names, num_names);
++        }
++        if (have_ppp)
++        {
++            if (!have_mmm)
++            {
++                vlog_info("Music: streaming from the PPPPPP blob...");
++            }
++            for (size_t i = 0; i < num_names; i++)
++            {
++                Local::add_named("vvvvvvmusic.vvv", ppp, names[i]);
++            }
++        }
++        else if (!have_mmm && !PHYSFS_exists("vvvvvvmusic.vvv"))
++        {
++            vlog_info("Music: no blob, trying loose files...");
++            for (size_t i = 0; i < num_names; i++)
++            {
++                const char* loose = names[i] + 5; /* strip "data/" */
++                PHYSFS_File* f = PHYSFS_openRead(loose);
++                if (f != NULL)
++                {
++                    const PHYSFS_sint64 len = PHYSFS_fileLength(f);
++                    PHYSFS_close(f);
++                    if (vvvstream::seekable(loose))
++                    {
++                        const int src = vvvstream::add_source(loose, 0, len);
++                        if (src >= 0)
++                        {
++                            musicTracks.push_back(MusicTrack(src, vvvstream::sources[src].channels, vvvstream::sources[src].rate));
++                        }
++                    }
++                }
++            }
++        }
++        num_pppppp_tracks = (int) musicTracks.size() - num_mmmmmm_tracks;
++        if (have_ppp)
++        {
++            num_pppppp_tracks += Local::add_extras("vvvvvvmusic.vvv", ppp, names, num_names);
++        }
++        if (musicTracks.empty())
++        {
++            vlog_warn("Music: no playable music found; continuing without music");
++        }
++        else
++        {
++            vlog_info("Music: %d streamed tracks (%d MMMMMM, %d PPPPPP); ring %d KiB, one decoder at a time",
++                (int) musicTracks.size(), num_mmmmmm_tracks, num_pppppp_tracks,
++                (int) (vvvstream::stats.ring_bytes / 1024));
++        }
++        return;
++    }
++#endif
++
+ #ifdef VVV_COMPILEMUSIC
+     binaryBlob musicWriteBlob;
+ #define FOREACH_TRACK(blob, track_name) blob.AddFileToBinaryBlob("data/" track_name);
+@@ -905,6 +1884,9 @@
+ 
+     pppppp_blob.clear();
+     mmmmmm_blob.clear();
++#ifdef VVV_MUSIC_STREAMING
++    vvvstream::stop_thread();
++#endif
+     VVV_freefunc(FAudioVoice_DestroyVoice, masteringvoice);
+     VVV_freefunc(FAudio_Release, faudioctx);
+ }

@@ -1,0 +1,190 @@
+diff -ruN b0001/include/SDL_hints.h b/include/SDL_hints.h
+--- b0001/include/SDL_hints.h	2026-10-21 22:50:24.526303792 +0200
++++ b/include/SDL_hints.h	2026-10-21 23:32:11.952884318 +0200
+@@ -2072,6 +2072,15 @@
+ #define SDL_HINT_PS2_GS_COLOR_SCALE "SDL_PS2_GS_COLOR_SCALE"
+ 
+ /**
++ * Software blitting / software renderer fast paths that produce bit-identical
++ * results: ARGB8888->ARGB8888 colour-modulated blending skips fully
++ * transparent and short-cuts fully opaque source pixels, and unrotated,
++ * unscaled SDL_RenderCopyEx flips are done with one plain blit instead of the
++ * rotozoom path. "0" (default) or "1". Re-evaluated when blits are re-selected.
++ */
++#define SDL_HINT_SW_BLIT_FASTPATHS "SDL_SW_BLIT_FASTPATHS"
++
++/**
+  * A variable to control whether the return key on the soft keyboard should
+  * hide the soft keyboard on Android and iOS.
+  *
+diff -ruN b0001/src/render/software/SDL_render_sw.c b/src/render/software/SDL_render_sw.c
+--- b0001/src/render/software/SDL_render_sw.c	2025-01-01 16:47:53.000000000 +0100
++++ b/src/render/software/SDL_render_sw.c	2026-10-21 23:32:42.932732260 +0200
+@@ -24,6 +24,7 @@
+ 
+ #include "../SDL_sysrender.h"
+ #include "SDL_render_sw_c.h"
++
+ #include "SDL_hints.h"
+ 
+ #include "SDL_draw.h"
+@@ -328,6 +329,40 @@
+         return -1;
+     }
+ 
++    /* SDL_HINT_SW_BLIT_FASTPATHS: an unrotated, unscaled flip is a mirrored
++     * copy of the source rect followed by the same blit the rotozoom path
++     * ends with, so do just that (one allocation, no trig, no extra passes). */
++    if (SDL_SWBlitFastpathsEnabled() && angle == 0.0 && scale_x == 1.0f && scale_y == 1.0f &&
++        srcrect->w == final_rect->w && srcrect->h == final_rect->h &&
++        src->format->BytesPerPixel == 4 && !SDL_MUSTLOCK(src)) {
++        SDL_Surface *mirror = SDL_CreateRGBSurfaceWithFormat(0, srcrect->w, srcrect->h, 32, src->format->format);
++        if (mirror) {
++            SDL_Rect dst = *final_rect;
++            int x, y;
++            for (y = 0; y < srcrect->h; ++y) {
++                const int sy = (flip & SDL_FLIP_VERTICAL) ? (srcrect->h - 1 - y) : y;
++                const Uint32 *srow = (const Uint32 *)((const Uint8 *)src->pixels + (srcrect->y + sy) * src->pitch) + srcrect->x;
++                Uint32 *drow = (Uint32 *)((Uint8 *)mirror->pixels + y * mirror->pitch);
++                if (flip & SDL_FLIP_HORIZONTAL) {
++                    for (x = 0; x < srcrect->w; ++x) {
++                        drow[x] = srow[srcrect->w - 1 - x];
++                    }
++                } else {
++                    SDL_memcpy(drow, srow, srcrect->w * 4);
++                }
++            }
++            SDL_GetSurfaceBlendMode(src, &blendmode);
++            SDL_GetSurfaceAlphaMod(src, &alphaMod);
++            SDL_GetSurfaceColorMod(src, &rMod, &gMod, &bMod);
++            SDL_SetSurfaceBlendMode(mirror, blendmode);
++            SDL_SetSurfaceAlphaMod(mirror, alphaMod);
++            SDL_SetSurfaceColorMod(mirror, rMod, gMod, bMod);
++            retval = SDL_BlitSurface(mirror, NULL, surface, &dst);
++            SDL_FreeSurface(mirror);
++            return retval;
++        }
++    }
++
+     tmp_rect.x = 0;
+     tmp_rect.y = 0;
+     tmp_rect.w = final_rect->w;
+diff -ruN b0001/src/video/SDL_blit.c b/src/video/SDL_blit.c
+--- b0001/src/video/SDL_blit.c	2025-01-01 16:47:53.000000000 +0100
++++ b/src/video/SDL_blit.c	2026-10-21 23:32:42.932411439 +0200
+@@ -28,6 +28,8 @@
+ #include "SDL_blit_slow.h"
+ #include "SDL_RLEaccel_c.h"
+ #include "SDL_pixels_c.h"
++#include "SDL_hints.h"
++#include "../SDL_hints_c.h"
+ 
+ /* The general purpose software blit routine */
+ static int SDLCALL SDL_SoftBlit(SDL_Surface *src, SDL_Rect *srcrect,
+@@ -187,6 +189,79 @@
+ }
+ #endif /* SDL_HAVE_BLIT_AUTO */
+ 
++/* SDL_HINT_SW_BLIT_FASTPATHS: bit-exact fast paths for the generic
++ * ARGB8888 -> ARGB8888 "Modulate_Blend" blitter. Cached via hint callback,
++ * read whenever a blit is (re)selected. */
++static SDL_bool SDL_sw_blit_fastpaths = SDL_FALSE;
++static SDL_bool SDL_sw_blit_fastpaths_hooked = SDL_FALSE;
++
++static void SDLCALL SDL_SWBlitFastpathsChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
++{
++    SDL_sw_blit_fastpaths = SDL_GetStringBoolean(hint, SDL_FALSE);
++}
++
++SDL_bool SDL_SWBlitFastpathsEnabled(void)
++{
++    if (!SDL_sw_blit_fastpaths_hooked) {
++        SDL_sw_blit_fastpaths_hooked = SDL_TRUE;
++        SDL_AddHintCallback(SDL_HINT_SW_BLIT_FASTPATHS, SDL_SWBlitFastpathsChanged, NULL);
++    }
++    return SDL_sw_blit_fastpaths;
++}
++
++/* Same arithmetic as SDL_Blit_ARGB8888_ARGB8888_Modulate_Blend (blit_auto)
++ * for flags MODULATE_COLOR [| MODULATE_ALPHA] | BLEND, plus two exact
++ * shortcuts: a source alpha of 0 leaves the destination unchanged, and a
++ * source alpha of 255 writes the modulated source with alpha 255. */
++static void SDL_Blit_ARGB8888_ARGB8888_ModulateBlend_Fast(SDL_BlitInfo *info)
++{
++    const int flags = info->flags;
++    const Uint32 modulateR = info->r;
++    const Uint32 modulateG = info->g;
++    const Uint32 modulateB = info->b;
++    const Uint32 modulateA = info->a;
++    const SDL_bool mod_alpha = (flags & SDL_COPY_MODULATE_ALPHA) ? SDL_TRUE : SDL_FALSE;
++
++    while (info->dst_h--) {
++        const Uint32 *src = (const Uint32 *)info->src;
++        Uint32 *dst = (Uint32 *)info->dst;
++        int n = info->dst_w;
++        while (n--) {
++            const Uint32 srcpixel = *src++;
++            Uint32 srcA = srcpixel >> 24;
++            Uint32 srcR, srcG, srcB;
++            if (mod_alpha) {
++                srcA = (srcA * modulateA) / 255;
++            }
++            if (srcA == 0) {
++                ++dst;
++                continue;
++            }
++            srcR = (((srcpixel >> 16) & 0xFF) * modulateR) / 255;
++            srcG = (((srcpixel >> 8) & 0xFF) * modulateG) / 255;
++            srcB = ((srcpixel & 0xFF) * modulateB) / 255;
++            if (srcA == 255) {
++                *dst++ = 0xFF000000u | (srcR << 16) | (srcG << 8) | srcB;
++            } else {
++                const Uint32 dstpixel = *dst;
++                const Uint32 inv = 255 - srcA;
++                Uint32 dstR = (dstpixel >> 16) & 0xFF, dstG = (dstpixel >> 8) & 0xFF;
++                Uint32 dstB = dstpixel & 0xFF, dstA = dstpixel >> 24;
++                srcR = (srcR * srcA) / 255;
++                srcG = (srcG * srcA) / 255;
++                srcB = (srcB * srcA) / 255;
++                dstR = srcR + (inv * dstR) / 255;
++                dstG = srcG + (inv * dstG) / 255;
++                dstB = srcB + (inv * dstB) / 255;
++                dstA = srcA + (inv * dstA) / 255;
++                *dst++ = (dstA << 24) | (dstR << 16) | (dstG << 8) | dstB;
++            }
++        }
++        info->src += info->src_pitch;
++        info->dst += info->dst_pitch;
++    }
++}
++
+ /* Figure out which of many blit routines to set up on a surface */
+ int SDL_CalculateBlit(SDL_Surface *surface)
+ {
+@@ -250,6 +325,15 @@
+         blit = SDL_CalculateBlitN(surface);
+     }
+ #endif
++    if (!blit) {
++        if (SDL_SWBlitFastpathsEnabled() &&
++            surface->format->format == SDL_PIXELFORMAT_ARGB8888 &&
++            dst->format->format == SDL_PIXELFORMAT_ARGB8888 &&
++            (map->info.flags & SDL_COPY_MODULATE_COLOR) && (map->info.flags & SDL_COPY_BLEND) &&
++            !(map->info.flags & ~(SDL_COPY_MODULATE_COLOR | SDL_COPY_MODULATE_ALPHA | SDL_COPY_BLEND | SDL_COPY_RLE_DESIRED))) {
++            blit = SDL_Blit_ARGB8888_ARGB8888_ModulateBlend_Fast;
++        }
++    }
+ #if SDL_HAVE_BLIT_AUTO
+     if (!blit) {
+         Uint32 src_format = surface->format->format;
+diff -ruN b0001/src/video/SDL_blit.h b/src/video/SDL_blit.h
+--- b0001/src/video/SDL_blit.h	2025-01-01 16:47:53.000000000 +0100
++++ b/src/video/SDL_blit.h	2026-10-21 23:32:42.932568193 +0200
+@@ -105,6 +105,7 @@
+ };
+ 
+ /* Functions found in SDL_blit.c */
++extern SDL_bool SDL_SWBlitFastpathsEnabled(void); /* SDL_HINT_SW_BLIT_FASTPATHS */
+ extern int SDL_CalculateBlit(SDL_Surface *surface);
+ 
+ /* Functions found in SDL_blit_*.c */

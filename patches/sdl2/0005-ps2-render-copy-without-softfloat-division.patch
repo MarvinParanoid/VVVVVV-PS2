@@ -1,0 +1,92 @@
+--- a/src/render/SDL_render.c
++++ b/src/render/SDL_render.c
+@@ -2516,12 +2516,57 @@
+     }
+ }
+ 
++#ifdef __PS2__
++extern SDL_bool SDL_PS2P3FastpathsEnabled(void); /* SDL_blit.c */
++extern SDL_bool SDL_ps2_p3_fastpaths, SDL_ps2_p3_fastpaths_hooked;
++/* per-copy check without a function call once the hint callback is set up */
++#define PS2_P3_ON() (SDL_ps2_p3_fastpaths_hooked ? SDL_ps2_p3_fastpaths : SDL_PS2P3FastpathsEnabled())
++#endif
++
+ static void RenderGetViewportSize(SDL_Renderer *renderer, SDL_FRect *rect)
+ {
++#ifdef __PS2__
++    /* Called for every copy; the double divisions are soft-float on the EE.
++     * Reuse the last result while the inputs are bit-identical. */
++    static SDL_Renderer *last_renderer = NULL;
++    static double last_w, last_h;
++    static float last_sx, last_sy, out_w, out_h;
++    if (!PS2_P3_ON()) {
++        rect->x = 0.0f;
++        rect->y = 0.0f;
++        rect->w = (float)(renderer->viewport.w / renderer->scale.x);
++        rect->h = (float)(renderer->viewport.h / renderer->scale.y);
++        return;
++    }
++    union { double d; Uint64 u; } vw, vh, lw, lh;
++    union { float f; Uint32 u; } sx, sy, lsx, lsy;
++    vw.d = renderer->viewport.w;
++    vh.d = renderer->viewport.h;
++    sx.f = renderer->scale.x;
++    sy.f = renderer->scale.y;
++    lw.d = last_w;
++    lh.d = last_h;
++    lsx.f = last_sx;
++    lsy.f = last_sy;
++    if (renderer != last_renderer || vw.u != lw.u || vh.u != lh.u || sx.u != lsx.u || sy.u != lsy.u) {
++        last_renderer = renderer;
++        last_w = renderer->viewport.w;
++        last_h = renderer->viewport.h;
++        last_sx = renderer->scale.x;
++        last_sy = renderer->scale.y;
++        out_w = (float)(renderer->viewport.w / renderer->scale.x);
++        out_h = (float)(renderer->viewport.h / renderer->scale.y);
++    }
++    rect->x = 0.0f;
++    rect->y = 0.0f;
++    rect->w = out_w;
++    rect->h = out_h;
++#else
+     rect->x = 0.0f;
+     rect->y = 0.0f;
+     rect->w = (float)(renderer->viewport.w / renderer->scale.x);
+     rect->h = (float)(renderer->viewport.h / renderer->scale.y);
++#endif
+ }
+ 
+ int SDL_RenderSetClipRect(SDL_Renderer *renderer, const SDL_Rect *rect)
+@@ -3569,6 +3614,21 @@
+     return SDL_RenderCopyExF(renderer, texture, srcrect, pdstfrect, angle, pfcenter, flip);
+ }
+ 
++/* angle == 0.0 (either sign) without a floating-point compare */
++static SDL_INLINE SDL_bool SDL_AngleIsZero(double angle)
++{
++    Uint64 bits;
++#ifdef __PS2__
++    if (!PS2_P3_ON()) {
++        return SDL_FALSE;
++    }
++#else
++    return SDL_FALSE;
++#endif
++    SDL_memcpy(&bits, &angle, sizeof(bits));
++    return (bits << 1) == 0 ? SDL_TRUE : SDL_FALSE;
++}
++
+ int SDL_RenderCopyExF(SDL_Renderer *renderer, SDL_Texture *texture,
+                       const SDL_Rect *srcrect, const SDL_FRect *dstrect,
+                       const double angle, const SDL_FPoint *center, const SDL_RendererFlip flip)
+@@ -3579,7 +3639,8 @@
+     int retval;
+     int use_rendergeometry;
+ 
+-    if (flip == SDL_FLIP_NONE && (int)(angle / 360) == angle / 360) { /* fast path when we don't need rotation or flipping */
++    /* (angle == 0.0 first: same result, without soft-float divisions on the PS2 EE) */
++    if (flip == SDL_FLIP_NONE && (SDL_AngleIsZero(angle) || (int)(angle / 360) == angle / 360)) { /* fast path when we don't need rotation or flipping */
+         return SDL_RenderCopyF(renderer, texture, srcrect, dstrect);
+     }
+ 

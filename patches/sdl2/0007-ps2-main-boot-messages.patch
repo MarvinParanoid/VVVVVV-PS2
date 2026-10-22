@@ -1,0 +1,34 @@
+--- a/src/main/ps2/SDL_ps2_main.c
++++ b/src/main/ps2/SDL_ps2_main.c
+@@ -32,6 +32,15 @@
+     }
+ }
+ 
++/* Start-up progress hook for the VVVVVV PS2 port: the application may define
++ * SDL_PS2_BootMessage() to show these steps (e.g. on a text screen) before
++ * any video is up, so a hang while loading IOP modules or waiting for the
++ * boot device is not just a black screen. */
++__attribute__((weak)) void SDL_PS2_BootMessage(const char *message)
++{
++    (void)message;
++}
++
+ static void prepare_IOP(void)
+ {
+     reset_IOP();
+@@ -56,11 +65,14 @@
+     int res;
+     char cwd[FILENAME_MAX];
+ 
++    SDL_PS2_BootMessage("IOP reset");
+     prepare_IOP();
++    SDL_PS2_BootMessage("loading IOP drivers (USB, memory card, HDD, CD)");
+     init_drivers();
+ 
+     getcwd(cwd, sizeof(cwd));
+-    waitUntilDeviceIsReady(cwd);
++    SDL_PS2_BootMessage("waiting for the boot device");
++    SDL_PS2_BootMessage(waitUntilDeviceIsReady(cwd) ? "boot device ready" : "boot device NOT ready (timed out)");
+ 
+     res = SDL_main(argc, argv);
+ 
