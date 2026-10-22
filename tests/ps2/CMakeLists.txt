@@ -47,6 +47,21 @@ if(PS2 AND EXISTS "${VVVVVV_BUILD}/libphysfs-static.a")
     set_target_properties(music_bench PROPERTIES SUFFIX ".elf")
 endif()
 
+# G1 GS renderer feasibility proof of concept (docs/ps2-gs-renderer-
+# feasibility.md): the same VVVVVV-like display lists through the software
+# renderer (gs_poc_sw, writes references) and as raw GS packets (gs_poc_gs).
+# Research only; nothing here is linked into the game.
+if(PS2 AND PS2_SDL_VARIANT STREQUAL "opt")
+    add_executable(gs_poc_sw gs_poc/sw_main.c gs_poc/scene.c)
+    target_compile_options(gs_poc_sw PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(gs_poc_sw PRIVATE harness SDL2::SDL2main SDL2::SDL2-static m)
+    set_target_properties(gs_poc_sw PROPERTIES SUFFIX ".elf")
+    add_executable(gs_poc_gs gs_poc/gs_main.c gs_poc/scene.c)
+    target_compile_options(gs_poc_gs PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(gs_poc_gs PRIVATE harness -lps2_drivers -lpatches -ldebug -lgraph -ldma m)
+    set_target_properties(gs_poc_gs PROPERTIES SUFFIX ".elf")
+endif()
+
 # P3 first-boot check for real hardware (USB mass storage via wLaunchELF).
 # No SDL: same IOP bring-up as SDL's PS2 main(), output via libdebug.
 if(PS2)
