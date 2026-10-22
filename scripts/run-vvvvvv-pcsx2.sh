@@ -44,9 +44,12 @@ LOGS="$REPO/logs/pcsx2/${LOG_TAG:-VVVVVV}"
 [[ -f "$DATA_ZIP" ]] || { echo "data.zip not found at $DATA_ZIP (set VVVVVV_DATA)" >&2; exit 2; }
 
 mkdir -p "$RUNDIR"
-# fresh run folder, but keep savedata/ between runs unless RESET_SAVE=1
+# fresh run folder, but keep savedata/ between runs unless RESET_SAVE=1.
+# Benchmark runs always start without savedata (KEEP_SAVE=1 overrides): saved
+# records (e.g. the Super Gravitron best time) are drawn in HUDs and would
+# change golden frames from run to run (found in P3.1).
 find "${RUNDIR:?}" -maxdepth 1 -mindepth 1 ! -name savedata -exec rm -rf {} +
-if [[ "${RESET_SAVE:-0}" == 1 ]]; then rm -rf "${RUNDIR:?}/savedata"; fi
+if [[ "${RESET_SAVE:-0}" == 1 || ( -n "${BENCH+x}" && "${KEEP_SAVE:-0}" != 1 ) ]]; then rm -rf "${RUNDIR:?}/savedata"; fi
 cp -r "$REPO/out/vvvvvv-ps2/." "$RUNDIR/"
 ln -sf "$(realpath "$DATA_ZIP")" "$RUNDIR/$(basename "$DATA_ZIP")"
 if [[ "${SOAK:-0}" == 1 ]]; then echo "scripted music soak test" > "$RUNDIR/music_soak.txt"; fi

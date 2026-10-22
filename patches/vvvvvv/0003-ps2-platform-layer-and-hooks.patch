@@ -44,7 +44,7 @@
 +#endif /* PS2PLATFORM_H */
 --- a/desktop_version/src/PS2Platform.cpp
 +++ b/desktop_version/src/PS2Platform.cpp
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,642 @@
 +#include "PS2Platform.h"
 +
 +#include <SDL.h>
@@ -408,6 +408,8 @@
 +    }
 +    /* P3 optimisations; all on unless bench.txt says opts=... (A/B runs) */
 +    SDL_SetHint("SDL_PS2_P3_FASTPATHS", (ps2_opts & PS2_OPT_SDL_FASTPATHS) ? "1" : "0");
++    /* P3.1: flipped copies (flip mode text and frame) without per-call surfaces */
++    SDL_SetHint("SDL_SW_FLIP_FASTPATH", (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "1" : "0");
 +#ifdef VVV_MUSIC_STREAMING
 +    {
 +        int fd = open("music_soak.txt", O_RDONLY);
@@ -687,7 +689,7 @@
 +}
 --- a/desktop_version/src/PS2Bench.h
 +++ b/desktop_version/src/PS2Bench.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,45 @@
 +#ifndef PS2BENCH_H
 +#define PS2BENCH_H
 +
@@ -709,7 +711,8 @@
 +#define PS2_OPT_TARGET_ABGR 0x1u    /* render targets in the textures' ABGR8888 layout */
 +#define PS2_OPT_SDL_FASTPATHS 0x2u  /* SDL_PS2_P3_FASTPATHS (SDL patches 0004-0006) */
 +#define PS2_OPT_WINDOW_CLEARS 0x4u  /* skip window clears that render() overwrites anyway */
-+#define PS2_OPT_OPAQUE_SCROLL 0x8u  /* scroll_texture() copies without blending */
++#define PS2_OPT_OPAQUE_SCROLL 0x8u  /* no effect: those targets are already blend NONE (P3.1) */
++#define PS2_OPT_FLIP_FASTPATH 0x10u /* SDL_SW_FLIP_FASTPATH (SDL patch 0008, P3.1) */
 +#define PS2_OPT_ALL 0xffffffffu
 +extern uint32_t ps2_opts;
 +/* diagnostics counted by game code */
@@ -734,7 +737,7 @@
 +#endif /* PS2BENCH_H */
 --- a/desktop_version/src/PS2Bench.cpp
 +++ b/desktop_version/src/PS2Bench.cpp
-@@ -0,0 +1,898 @@
+@@ -0,0 +1,916 @@
 +#include "PS2Bench.h"
 +
 +#include <SDL.h>
@@ -800,6 +803,9 @@
 +static int enabled;
 +static int cfg_settle_s = 4, cfg_measure_s = 20, cfg_over30 = -1, cfg_profile = 1, cfg_verify = 1, cfg_golden_ticks = 90;
 +static int cfg_overlay;
++/* flip=1: run the scenes in Flip Mode (graphics.setflipmode, applied by
++ * startgamemode), to measure the flipped-text and flipped-frame paths */
++static int cfg_flip;
 +/* compact per-scene summary, written once as bench_results.txt at the end */
 +static char results[4096];
 +static size_t results_len;
@@ -1018,6 +1024,7 @@
 +        else if (strcmp(line, "opts") == 0) ps2_opts = (uint32_t) strtoul(v, NULL, 0);
 +        else if (strcmp(line, "scenes") == 0) SDL_strlcpy(cfg_scenes, v, sizeof(cfg_scenes));
 +        else if (strcmp(line, "overlay") == 0) cfg_overlay = atoi(v);
++        else if (strcmp(line, "flip") == 0) cfg_flip = atoi(v);
 +        else if (strcmp(line, "preset") == 0 && strcmp(v, "hardware") == 0)
 +        {
 +            /* the scenes asked for in H1, unchanged from P3 */
@@ -1030,12 +1037,12 @@
 +    {
 +        PS2Diag_SetOverlay(1);
 +    }
-+    result_line("# VVVVVV PS2 benchmark: settle=%d s measure=%d s over30=%d opts=0x%lx overlay=%d\n"
++    result_line("# VVVVVV PS2 benchmark: settle=%d s measure=%d s over30=%d opts=0x%lx overlay=%d flip=%d\n"
 +                "# times in ms; tps = logic ticks per second (full speed %.1f); tps_min = slowest 1 s window\n"
 +                "# scene            tps   tps_min frame  p95    p99    max    render underruns mem_MiB\n",
-+                cfg_settle_s, cfg_measure_s, cfg_over30, (unsigned long) ps2_opts, cfg_overlay, 1000.0 / 34);
-+    PS2_Log("BENCH enabled: settle=%d measure=%d over30=%d profile=%d verify=%d opts=0x%lx scenes=%s",
-+            cfg_settle_s, cfg_measure_s, cfg_over30, cfg_profile, cfg_verify, (unsigned long) ps2_opts,
++                cfg_settle_s, cfg_measure_s, cfg_over30, (unsigned long) ps2_opts, cfg_overlay, cfg_flip, 1000.0 / 34);
++    PS2_Log("BENCH enabled: settle=%d measure=%d over30=%d profile=%d verify=%d opts=0x%lx flip=%d scenes=%s",
++            cfg_settle_s, cfg_measure_s, cfg_over30, cfg_profile, cfg_verify, (unsigned long) ps2_opts, cfg_flip,
 +            cfg_scenes[0] ? cfg_scenes : "(all)");
 +}
 +
@@ -1426,6 +1433,17 @@
 +    free(img);
 +}
 +
++/* The SDL-level switches are hints; ps2_opts alone does not change them after
++ * PS2_PreInit, so the verify pass sets them too (P3.1: before this, the
++ * reference pass still used every SDL fast path). PS2_OPT_TARGET_ABGR takes
++ * effect only when the targets are created at start-up, so it cannot be
++ * compared here; golden frames across builds with opts= in bench.txt do. */
++static void apply_sdl_opts(uint32_t opts)
++{
++    SDL_SetHint("SDL_PS2_P3_FASTPATHS", (opts & PS2_OPT_SDL_FASTPATHS) ? "1" : "0");
++    SDL_SetHint("SDL_SW_FLIP_FASTPATH", (opts & PS2_OPT_FLIP_FASTPATH) ? "1" : "0");
++}
++
 +void PS2Bench_Verify(void (*render)(void))
 +{
 +    if (want_golden)
@@ -1450,6 +1468,7 @@
 +    for (int pass = 0; pass < 2; pass++)
 +    {
 +        ps2_opts = pass == 0 ? 0 : enabled_opts;
++        apply_sdl_opts(ps2_opts);
 +        srand(12345);
 +        graphics.clear();
 +        graphics.set_render_target(graphics.gameTexture);
@@ -1458,12 +1477,13 @@
 +        SDL_RenderReadPixels(rend, NULL, SDL_PIXELFORMAT_ARGB8888, img[pass], pitch);
 +    }
 +    ps2_opts = enabled_opts;
++    apply_sdl_opts(ps2_opts);
 +    uint32_t diff = 0;
 +    for (int i = 0; i < w * h; i++)
 +    {
 +        diff += ((const uint32_t*) img[0])[i] != ((const uint32_t*) img[1])[i];
 +    }
-+    PS2_Log("VERIFY scene=%s opts=0x%lx: %lu of %d pixels differ between reference and optimised render",
++    PS2_Log("VERIFY scene=%s opts=0x%lx: %lu of %d pixels differ between reference (SDL fast paths off) and optimised render",
 +               scenes[scene].name, (unsigned long) enabled_opts, (unsigned long) diff, w * h);
 +    char path[64];
 +    SDL_snprintf(path, sizeof(path), "frame_%02d_%s.ppm", scene, scenes[scene].name);
@@ -1569,6 +1589,7 @@
 +                scenes[scene].name, game.gamestate);
 +        srand(1);
 +        ride_camera = false;
++        graphics.setflipmode = cfg_flip != 0;
 +        scenes[scene].setup();
 +        if (cfg_over30 >= 0)
 +        {

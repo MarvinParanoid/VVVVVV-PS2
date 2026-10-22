@@ -218,6 +218,8 @@ scripts/ps2-profile.py out/vvvvvv-ps2/VVVVVV.elf --addr <EPC> <RA>
 | P3: rendering optimisation | [ps2-p3-report.md](docs/ps2-p3-report.md) |
 | H1: hardware readiness | [ps2-h1-hardware-readiness.md](docs/ps2-h1-hardware-readiness.md) |
 | H1.1: release candidate | [ps2-h1-release-candidate.md](docs/ps2-h1-release-candidate.md) |
+| G1: GS renderer feasibility (deferred) | [ps2-gs-renderer-feasibility.md](docs/ps2-gs-renderer-feasibility.md) |
+| P3.1: software renderer edge cases (Flip Mode) | [ps2-p3.1-software-renderer-edge-cases.md](docs/ps2-p3.1-software-renderer-edge-cases.md) |
 
 These reports refer to `logs/` and `release/` folders. Those are local outputs of the scripts and are not part of the repository.
 

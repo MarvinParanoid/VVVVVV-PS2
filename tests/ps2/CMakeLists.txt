@@ -47,6 +47,17 @@ if(PS2 AND EXISTS "${VVVVVV_BUILD}/libphysfs-static.a")
     set_target_properties(music_bench PROPERTIES SUFFIX ".elf")
 endif()
 
+# P3.1 flipped-copy fast path (patches/sdl2/0008): bit-exactness against
+# SDL's rotozoom path, and timing. Needs the patched SDL (opt variant).
+if(PS2_SDL_VARIANT STREQUAL "opt")
+    add_executable(flip_exact flip_exact/main.c)
+    target_compile_options(flip_exact PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(flip_exact PRIVATE harness SDL2::SDL2main SDL2::SDL2-static m)
+    if(PS2)
+        set_target_properties(flip_exact PROPERTIES SUFFIX ".elf")
+    endif()
+endif()
+
 # G1 GS renderer feasibility proof of concept (docs/ps2-gs-renderer-
 # feasibility.md): the same VVVVVV-like display lists through the software
 # renderer (gs_poc_sw, writes references) and as raw GS packets (gs_poc_gs).

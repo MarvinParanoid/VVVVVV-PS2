@@ -1,0 +1,161 @@
+--- a/src/render/software/SDL_render_sw.c
++++ b/src/render/software/SDL_render_sw.c
+@@ -26,6 +26,7 @@
+ #include "SDL_render_sw_c.h"
+ 
+ #include "SDL_hints.h"
++#include "../../SDL_hints_c.h" /* SDL_GetStringBoolean (SDL_SW_FLIP_FASTPATH) */
+ 
+ #include "SDL_draw.h"
+ #include "SDL_blendfillrect.h"
+@@ -310,6 +311,128 @@
+     return retval;
+ }
+ 
++/* SDL_SW_FLIP_FASTPATH (VVVVVV PS2 port, docs/ps2-p3.1-software-renderer-
++ * edge-cases.md): flipped copies at angle 0 through one persistent scratch
++ * surface in the source's format. The source rect is scaled into the scratch
++ * the way the rotozoom path below scales it (NEAREST, no modulation, no
++ * blending), its rows/columns are reversed in place, and the scratch is
++ * blitted 1:1 with the source's modulation and blend mode, so clipping also
++ * happens after scaling, as below. That is the rotozoom path's own sequence
++ * without its per-call surface allocations, its ARGB8888 intermediate and the
++ * rotation. Unscaled copies mirror straight into the scratch. On by default,
++ * only together with SDL_HINT_SW_BLIT_FASTPATHS; "0" restores the previous
++ * code exactly (A/B runs). */
++static SDL_bool sw_flip_fastpath = SDL_TRUE;
++static SDL_bool sw_flip_fastpath_hooked = SDL_FALSE;
++static SDL_Surface *sw_flip_scratch = NULL;
++
++static void SDLCALL SW_FlipFastpathChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
++{
++    sw_flip_fastpath = SDL_GetStringBoolean(hint, SDL_TRUE);
++}
++
++static SDL_bool SW_FlipFastpathEnabled(void)
++{
++    if (!sw_flip_fastpath_hooked) {
++        sw_flip_fastpath_hooked = SDL_TRUE;
++        SDL_AddHintCallback("SDL_SW_FLIP_FASTPATH", SW_FlipFastpathChanged, NULL);
++    }
++    return sw_flip_fastpath;
++}
++
++/* Returns SDL_TRUE when the copy was done (its result in *result). */
++static SDL_bool SW_FlippedCopy(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *surface,
++                               const SDL_Rect *final_rect, SDL_ScaleMode scaleMode, SDL_RendererFlip flip, int *result)
++{
++    const int w = final_rect->w, h = final_rect->h;
++    SDL_Surface *scratch = sw_flip_scratch;
++    SDL_Rect region, dst;
++    SDL_BlendMode blendmode;
++    Uint8 alphaMod, rMod, gMod, bMod;
++    int x, y;
++
++    if (w <= 0 || h <= 0) {
++        return SDL_FALSE;
++    }
++    if (!scratch || scratch->format->format != src->format->format || scratch->w < w || scratch->h < h) {
++        int cw = w, ch = h;
++        if (scratch && scratch->format->format == src->format->format) {
++            cw = SDL_max(cw, scratch->w);
++            ch = SDL_max(ch, scratch->h);
++        }
++        SDL_FreeSurface(scratch);
++        scratch = sw_flip_scratch = SDL_CreateRGBSurfaceWithFormat(0, cw, ch, 32, src->format->format);
++        if (!scratch) {
++            return SDL_FALSE;
++        }
++    }
++    region.x = 0;
++    region.y = 0;
++    region.w = w;
++    region.h = h;
++    SDL_GetSurfaceBlendMode(src, &blendmode);
++    SDL_GetSurfaceAlphaMod(src, &alphaMod);
++    SDL_GetSurfaceColorMod(src, &rMod, &gMod, &bMod);
++
++    if (srcrect->w == w && srcrect->h == h) {
++        for (y = 0; y < h; ++y) {
++            const int sy = (flip & SDL_FLIP_VERTICAL) ? (h - 1 - y) : y;
++            const Uint32 *srow = (const Uint32 *)((const Uint8 *)src->pixels + (srcrect->y + sy) * src->pitch) + srcrect->x;
++            Uint32 *drow = (Uint32 *)((Uint8 *)scratch->pixels + y * scratch->pitch);
++            if (flip & SDL_FLIP_HORIZONTAL) {
++                for (x = 0; x < w; ++x) {
++                    drow[x] = srow[w - 1 - x];
++                }
++            } else {
++                SDL_memcpy(drow, srow, w * 4);
++            }
++        }
++    } else {
++        SDL_Rect sr = *srcrect, scaled = region;
++        int rc;
++        if (scaleMode != SDL_ScaleModeNearest) {
++            return SDL_FALSE;
++        }
++        SDL_SetSurfaceBlendMode(src, SDL_BLENDMODE_NONE);
++        SDL_SetSurfaceAlphaMod(src, 255);
++        SDL_SetSurfaceColorMod(src, 255, 255, 255);
++        rc = SDL_PrivateUpperBlitScaled(src, &sr, scratch, &scaled, scaleMode);
++        SDL_SetSurfaceBlendMode(src, blendmode);
++        SDL_SetSurfaceAlphaMod(src, alphaMod);
++        SDL_SetSurfaceColorMod(src, rMod, gMod, bMod);
++        if (rc < 0 || scaled.w != w || scaled.h != h) {
++            return SDL_FALSE;
++        }
++        if (flip & SDL_FLIP_VERTICAL) {
++            for (y = 0; y < h / 2; ++y) {
++                Uint32 *a = (Uint32 *)((Uint8 *)scratch->pixels + y * scratch->pitch);
++                Uint32 *b = (Uint32 *)((Uint8 *)scratch->pixels + (h - 1 - y) * scratch->pitch);
++                for (x = 0; x < w; ++x) {
++                    const Uint32 t = a[x];
++                    a[x] = b[x];
++                    b[x] = t;
++                }
++            }
++        }
++        if (flip & SDL_FLIP_HORIZONTAL) {
++            for (y = 0; y < h; ++y) {
++                Uint32 *row = (Uint32 *)((Uint8 *)scratch->pixels + y * scratch->pitch);
++                for (x = 0; x < w / 2; ++x) {
++                    const Uint32 t = row[x];
++                    row[x] = row[w - 1 - x];
++                    row[w - 1 - x] = t;
++                }
++            }
++        }
++    }
++    SDL_SetSurfaceBlendMode(scratch, blendmode);
++    SDL_SetSurfaceAlphaMod(scratch, alphaMod);
++    SDL_SetSurfaceColorMod(scratch, rMod, gMod, bMod);
++    dst = *final_rect;
++    *result = SDL_BlitSurface(scratch, &region, surface, &dst);
++    return SDL_TRUE;
++}
++
+ static int SW_RenderCopyEx(SDL_Renderer *renderer, SDL_Surface *surface, SDL_Texture *texture,
+                            const SDL_Rect *srcrect, const SDL_Rect *final_rect,
+                            const double angle, const SDL_FPoint *center, const SDL_RendererFlip flip, float scale_x, float scale_y)
+@@ -329,6 +452,12 @@
+         return -1;
+     }
+ 
++    if (SDL_SWBlitFastpathsEnabled() && SW_FlipFastpathEnabled() && angle == 0.0 && scale_x == 1.0f &&
++        scale_y == 1.0f && flip != SDL_FLIP_NONE && src->format->BytesPerPixel == 4 && !SDL_MUSTLOCK(src) &&
++        SW_FlippedCopy(src, srcrect, surface, final_rect, texture->scaleMode, flip, &retval)) {
++        return retval;
++    }
++
+     /* SDL_HINT_SW_BLIT_FASTPATHS: an unrotated, unscaled flip is a mirrored
+      * copy of the source rect followed by the same blit the rotozoom path
+      * ends with, so do just that (one allocation, no trig, no extra passes). */
+@@ -1157,6 +1286,8 @@
+         SDL_DestroyWindowSurface(window);
+     }
+     SDL_free(data);
++    SDL_FreeSurface(sw_flip_scratch);
++    sw_flip_scratch = NULL;
+ }
+ 
+ int SW_CreateRendererForSurface(SDL_Renderer *renderer, SDL_Surface *surface)

@@ -163,6 +163,8 @@ All measured on the baseline. Profile shares are of all EE samples.
 - When the camera has to chase the player, 1,300 tiles are redrawn in `renderfixed`: 30 ms/tick.
 - Otherwise `scroll_texture` makes two full blended copies of a 336×336 texture per tick: `BlitRGBtoRGBPixelAlpha` + memcpy, 22% in tower_climb.
 
+  > **Correction (P3.1, [ps2-p3.1-software-renderer-edge-cases.md](ps2-p3.1-software-renderer-edge-cases.md)).** These copies were never blended: `backgroundTexture`, `tempScrollingTexture`, `towerbg.texture` and `titlebg.texture` keep SDL's default blend mode NONE. `scroll_texture` accounts for the `memcpy` part. The `BlitRGBtoRGBPixelAlpha` part comes from the unmodulated BLEND tiles drawn every tick.
+
 **6. Per-call overhead** in 1,300–1,550-draw frames: `SDL_RenderCopyF`, `UpperBlit`, `IntersectRect`, `PrepQueueCmdDraw` and similar, together about 15%.
 
 **7. Music decoding** (~10% CPU) and **memcpy** of whole frames (8–14%) remain after P3 (§10).
@@ -185,8 +187,14 @@ All are bit-exact by construction and verified (§6). Each is a runtime switch, 
 | 4 | **Dead-clear elimination** | SDL patch 0003 | A clear is dropped when the next pixel command in the batch is another clear or an unscaled, unblended copy that covers the whole surface after viewport/clip, emulating `SetDrawState` exactly |
 | 5 | **Skip redundant window clears** | VVVVVV patch 0005 / main.cpp hook (`PS2_OPT_WINDOW_CLEARS`) | The two window clears that `render()`'s full-window copy always overwrites, only when the stretch rectangle is the whole window |
 | 6 | **Window framebuffer in GS texture memory** | SDL patch 0006 | The window surface *is* the streaming texture's buffer, so `UpdateWindowTexture` no longer copies it. Present waits for the GS before returning, so the next frame can be drawn in place |
-| 7 | **Opaque scroll copies** | VVVVVV patch 0005 (`PS2_OPT_OPAQUE_SCROLL`) | `scroll_texture` copies without blending. The scrolled backgrounds are built from `clear()` + blended draws, so they are opaque and a blended copy writes exactly the source |
+| 7 | **Opaque scroll copies** (**no effect**, see the correction below) | VVVVVV patch 0005 (`PS2_OPT_OPAQUE_SCROLL`) | Forces `scroll_texture`'s copies to blend NONE. They already were NONE, so the flag changes nothing (P3.1) |
 | 8 | **30 Hz rendering by default on PS2** | VVVVVV patch 0005 (`Game.cpp`) | `over30mode` defaults to off on PS2: one render per logic tick. The "30+ FPS" option is still available (§5.3) |
+
+**Correction (P3.1).** Two corrections to the table above and the benchmark tooling:
+- `PS2_OPT_OPAQUE_SCROLL` (row 7) has never had an effect. Its share of the improvement in the final step came from row 8.
+- The benchmark's in-run `VERIFY` check only switched `ps2_opts`. The SDL fast paths are hints, set once at start-up, so the reference render still used them, and `PS2_OPT_TARGET_ABGR` only acts when the targets are created. The bit-exactness results in §6 do not depend on it: they come from golden frames compared **across builds** (`opts=0` in `bench.txt` at start-up) and from `sw_exact`. Since P3.1, `VERIFY` also switches the SDL hints.
+
+Details: [ps2-p3.1-software-renderer-edge-cases.md](ps2-p3.1-software-renderer-edge-cases.md).
 
 **Problems found and fixed on the way:**
 - **Profiler setup.** `SetTimerHandler` on an allocated counter only fired alongside other alarms (3 samples in 20 s). It was replaced by a self-re-arming `SetTimerAlarm`.
