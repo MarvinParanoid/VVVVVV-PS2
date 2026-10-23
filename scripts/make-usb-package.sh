@@ -4,7 +4,11 @@
 #   scripts/make-usb-package.sh <your data.zip> [<out-dir>] [--no-build] [--image <file.img>]
 #   scripts/make-usb-package.sh <your data.zip> [<out-dir>] --from-release release/VVVVVV-PS2-<ID>
 #   ... [--folder NAME] [--label TEXT]
+#   scripts/make-usb-package.sh --no-data [<out-dir>] [--from-release ... | --no-build] [--folder ...]
 #
+# --no-data: lay out the folder without game data (no data.zip needed). The
+# tester (or anyone) then runs prepare-ps2-usb.py <their data.zip> <folder>,
+# which adds exactly what the full mode adds (public tester releases).
 # --folder NAME: package folder name instead of VVVVVV (e.g. VVVVVV-P31DEV for an
 # experimental build next to a release on the same stick: saves and logs are
 # written next to the ELF, so separate folders never share them).
@@ -36,7 +40,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 
-DATA_ZIP= OUT= BUILD=1 IMAGE= RELEASE= FOLDER=VVVVVV LABEL=
+DATA_ZIP= OUT= BUILD=1 IMAGE= RELEASE= FOLDER=VVVVVV LABEL= NODATA=0
 if [[ -f "$HERE/SHA256SUMS" && -d "$HERE/bin" ]]; then RELEASE="$HERE"; fi # running the copy inside a release
 while (($#)); do
     case "$1" in
@@ -45,30 +49,24 @@ while (($#)); do
         --image) IMAGE="$2"; shift ;;
         --folder) FOLDER="$2"; shift ;;
         --label) LABEL="$2"; shift ;;
+        --no-data) NODATA=1 ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
-        *) if [[ -z "$DATA_ZIP" ]]; then DATA_ZIP="$1"; elif [[ -z "$OUT" ]]; then OUT="$1"; else exit 2; fi ;;
+        *) if [[ -z "$DATA_ZIP" && $NODATA == 0 ]]; then DATA_ZIP="$1"; elif [[ -z "$OUT" ]]; then OUT="$1"; else exit 2; fi ;;
     esac
     shift
 done
-[[ -n "$DATA_ZIP" && -f "$DATA_ZIP" ]] || { sed -n 2,4p "$0" >&2; exit 2; }
+if ((NODATA)); then
+    # positional arguments before --no-data: the first one is the out-dir
+    if [[ -n "$DATA_ZIP" && -z "$OUT" ]]; then OUT="$DATA_ZIP"; DATA_ZIP=; fi
+    [[ -z "$DATA_ZIP" ]] || { echo "--no-data takes no data.zip" >&2; exit 2; }
+    [[ -z "$IMAGE" ]] || { echo "--image needs game data" >&2; exit 2; }
+else
+    [[ -n "$DATA_ZIP" && -f "$DATA_ZIP" ]] || { sed -n 2,4p "$0" >&2; exit 2; }
+fi
 
-# The input must be the game's data.zip with everything the PS2 build loads.
-python3 -I - "$DATA_ZIP" <<'EOF'
-import sys, zipfile
-graphics = ("covered elephant ending entcolours flipgamecomplete fliplevelcomplete flipsprites gamecomplete "
-            "levelcomplete minimap site site2 site3 site4 sprites teleporter tiles tiles2 tiles3").split()
-sounds = ("blip blip2 coin combine countdown crash crashing crew1 crew2 crew3 crew4 crew5 crew6 crumble gamesaved "
-          "go hurt jump jump2 newrecord preteleport rescue save souleyeminijingle teleport terminal trophy vanish").split()
-needed = ["vvvvvvmusic.vvv", "VVVVVV.png"] + [f"graphics/{g}.png" for g in graphics] + [f"sounds/{x}.wav" for x in sounds]
-try:
-    names = set(zipfile.ZipFile(sys.argv[1]).namelist())
-except zipfile.BadZipFile as e:
-    sys.exit(f"{sys.argv[1]}: not a zip archive ({e})")
-missing = [n for n in needed if n not in names]
-if missing:
-    sys.exit(f"{sys.argv[1]}: not a complete VVVVVV data.zip, missing {len(missing)}: {', '.join(missing[:8])}")
-print(f"data.zip: all {len(needed)} required entries present ({len(names)} entries)")
-EOF
+# The input must be the game's data.zip with everything the PS2 build loads
+# (prepare-ps2-usb.py holds the list; testers use the same tool).
+if ((!NODATA)); then python3 -I "$HERE/prepare-ps2-usb.py" --check "$DATA_ZIP"; fi
 if [[ -n "$RELEASE" ]]; then
     BUILD=0
     (cd "$RELEASE" && sha256sum -c --quiet SHA256SUMS) || { echo "$RELEASE: SHA256SUMS mismatch, release modified?" >&2; exit 2; }
@@ -103,7 +101,6 @@ if [[ -n "$RELEASE" ]]; then
         echo "release $(basename "$RELEASE"); unstripped ELFs (for symbolising crash addresses):"
         (cd "$RELEASE" && grep ' ./symbols/' SHA256SUMS)
     } >> "$PKG/SOURCE.txt"
-    REPACK="$RELEASE/repack-data-zip.py"
     README="$RELEASE/README-PS2.txt"
 else
 # Stripped ELFs (about half the size; wLaunchELF only loads the program
@@ -120,10 +117,8 @@ cp -r "$REPO/out/vvvvvv-ps2/lang" "$REPO/out/vvvvvv-ps2/fonts" "$REPO/out/vvvvvv
     echo "unstripped ELFs (for symbolising crash addresses):"
     (cd "$REPO" && sha256sum out/vvvvvv-ps2/VVVVVV.elf out/vvvvvv-ps2/VVVVVV-nomusic.elf build/ps2-tests-opt/fs_smoke.elf)
 } >> "$PKG/SOURCE.txt"
-REPACK="$REPO/scripts/repack-data-zip.py"
 README="$REPO/docs/ps2-usb-readme.txt"
 fi
-python3 -I "$REPACK" "$DATA_ZIP" "$PKG/data-ps2.zip"
 if [[ -n "$LABEL" ]]; then
     { printf '*** %s ***\n*** build: %s, folder: %s ***\n\n' "$LABEL" "$(head -1 "$PKG/SOURCE.txt")" "$FOLDER"
       cat "$README"; } > "$PKG/README-PS2.txt"
@@ -133,55 +128,14 @@ fi
 mkdir -p "$PKG/optional"
 printf 'preset=hardware\n' > "$PKG/optional/bench.txt"
 printf 'overlay on at start (L3+R3 toggles it)\n' > "$PKG/optional/overlay.txt"
-# CRC32s for fs_smoke.elf: whole small files plus the ELF, and fixed 32 KB
-# chunks spread over data-ps2.zip (exercises seeking in the 63 MB file).
-python3 -I - "$PKG" <<'EOF'
-import os, sys, zlib
-pkg = sys.argv[1]
-out = ["# fs_smoke.elf re-reads these from the USB stick and compares CRC32s"]
-for rel in ["README-PS2.txt", "SOURCE.txt", "fonts/font.png", "lang/en/meta.xml", "VVVVVV.elf"]:
-    data = open(os.path.join(pkg, rel), "rb").read()
-    out.append(f"file {rel} {len(data)} {zlib.crc32(data):08x}")
-zp = os.path.join(pkg, "data-ps2.zip")
-size = os.path.getsize(zp)
-with open(zp, "rb") as f:
-    for i in range(24):
-        off = 0 if i == 0 else size - 32768 if i == 23 else (size // 23) * i + (i * 4099) % 32768
-        f.seek(off)
-        data = f.read(32768)
-        out.append(f"chunk data-ps2.zip {off} {len(data)} {zlib.crc32(data):08x}")
-open(os.path.join(pkg, "fs_smoke_expect.txt"), "w").write("\n".join(out) + "\n")
-EOF
-(cd "$PKG" && find . -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256)
-
-# FAT32 rules: files < 4 GiB, no characters FAT forbids, no two names that
-# differ only in case, paths within 255 characters.
-python3 -I - "$PKG" <<'EOF'
-import os, sys
-root = sys.argv[1]
-bad, seen, total = [], {}, 0
-for d, dirs, files in os.walk(root):
-    for n in dirs + files:
-        p = os.path.join(d, n)
-        rel = os.path.relpath(p, os.path.dirname(root))
-        if any(c in n for c in '<>:"\\|?*') or n.endswith((" ", ".")):
-            bad.append(f"name not allowed on FAT: {rel}")
-        key = os.path.join(d, n).lower()
-        if key in seen:
-            bad.append(f"names differ only in case: {rel} / {seen[key]}")
-        seen[key] = rel
-        if len(rel) > 255:
-            bad.append(f"path longer than 255: {rel}")
-        if os.path.isfile(p):
-            size = os.path.getsize(p)
-            total += size
-            if size >= 4 << 30:
-                bad.append(f"file over 4 GiB: {rel}")
-print(f"package: {len(seen)} entries, {total / 1048576:.1f} MiB")
-for b in bad:
-    print("FAT32 problem:", b)
-sys.exit(1 if bad else 0)
-EOF
+# data-ps2.zip (repack-data-zip.py), fs_smoke_expect.txt, MANIFEST.sha256,
+# FAT32 rules and a checksum pass: the same tool testers run on their own
+# data.zip (scripts/prepare-ps2-usb.py).
+if ((NODATA)); then
+    echo "laid out without game data: $PKG (next: prepare-ps2-usb.py <data.zip> $PKG)"
+    exit 0
+fi
+python3 -I "$HERE/prepare-ps2-usb.py" "$DATA_ZIP" "$PKG"
 
 if [[ -n "$IMAGE" ]]; then
     command -v mcopy >/dev/null || { echo "--image needs mtools (mcopy)" >&2; exit 2; }
@@ -192,5 +146,4 @@ if [[ -n "$IMAGE" ]]; then
     fsck.fat -n "$IMAGE"
     echo "FAT32 image: $IMAGE"
 fi
-(cd "$PKG" && sha256sum -c --quiet MANIFEST.sha256) && echo "checksums OK"
 echo "ready: $PKG  (copy the $FOLDER folder to the root of a FAT32 USB stick)"
