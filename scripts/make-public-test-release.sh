@@ -96,9 +96,9 @@ rm -f "$T/.ps2sdk-license"
     echo "VVVVVV-PS2 tester release $NAME - unofficial, NOT validated on real PS2 hardware"
     echo
     echo "usb/VVVVVV          frozen release candidate H1-RC2 (unchanged binaries)"
-    sed 's/^/                    /' "$T/usb/VVVVVV/SOURCE.txt" | head -3
+    grep -E '^(build|repo|upstream) ' "$T/usb/VVVVVV/SOURCE.txt" | sed 's/^/                    /'
     echo "usb/VVVVVV-P31DEV   experimental build $EXP_ID"
-    sed 's/^/                    /' "$T/usb/VVVVVV-P31DEV/SOURCE.txt" | head -3
+    grep -E '^(build|repo|upstream) ' "$T/usb/VVVVVV-P31DEV/SOURCE.txt" | sed 's/^/                    /'
     echo
     echo "Stripped ELFs in this archive (sha256):"
     (cd "$T" && sha256sum usb/*/*.elf)
