@@ -12,7 +12,7 @@ Do the sessions **in order**. Session 1 must be complete before the experimental
 1. Preparing the stick
 2. Session 1: H1-RC2 baseline
 3. Session 2: P3.2-T1 (experimental)
-4. Session 3: G1 prototypes (optional)
+4. Session 3: G1 prototypes (optional); 4b/4c: optional diagnostics builds
 5. Getting the files back
 6. Expected results (PCSX2) and what counts as a pass
 7. Troubleshooting
@@ -165,6 +165,67 @@ Run this with `out/` built as `P3.3-DIAG-DEV`. Copy `VVVVVV-P33DIAG/` next to th
   That works even when no file reaches the PC.
 - Metrics and limits: [ps2-hardware-diagnostics.md](ps2-hardware-diagnostics.md).
 
+## 4c. Optional: P3.4 hardware diagnostics build (folder `VVVVVV-P34DIAG`)
+
+Same game as 4b, plus audio-output diagnostics and a crash screen that does not depend on the crashed thread's stack ([ps2-hardware-diagnostics.md](ps2-hardware-diagnostics.md) §7–8). **Use it if session 1 or 2 shows audio trouble (buzz, repeats, crackle) or a hang/crash without a screen.**
+
+**Prepare** with `out/` built as `P3.4-HW-DIAG`:
+
+```sh
+scripts/make-usb-package.sh <data.zip> build/usb-p34 --no-build --folder VVVVVV-P34DIAG --label "P3.4-HW-DIAG - hardware diagnostics, EXPERIMENTAL"
+```
+
+Never copy `crashtest.txt` or `audiostall.txt` to the stick for a normal session; they crash or stall the game on purpose.
+
+**Use:**
+- Play with music for a few minutes in normal rooms, then with the DIAG page up (L3+R3 three times).
+- Photograph DIAG after a few minutes, and again right after anything you heard.
+- **What the audio rows mean:**
+  - `AUDSRV Q` is how much audio is queued on the IOP. In PCSX2 it is 74–95 ms; the minimum never went below 74 ms in normal play.
+  - `SUBMIT gap` is the longest pause in feeding it. In PCSX2 it is 21–23 ms.
+  - `late` and `DRY EST` count dry-outs by the clock. Both are 0 in PCSX2.
+- Bring back `vvvvvv_ps2.log`: it has an `AUDSRV` line every 10 s and a `DIAG` line with the renderer and flip counters.
+
+## Record in every session
+
+**Before you start:**
+- PS2 model (sticker, e.g. SCPH-75004) and region;
+- launcher (FMCB / PS2BBL version, wLaunchELF version);
+- USB stick brand, model and capacity, and the port used;
+- FAT32 cluster size: on Linux `sudo fsck.fat -n -v /dev/sdX1`, or the allocation unit size shown when formatting on Windows;
+- whether an HDD is installed (fat consoles) or a network adapter is attached;
+- TV and cable.
+
+**Times, with a stopwatch, from pressing Cross on the ELF in wLaunchELF:**
+- to the first visible output (the white start-up list);
+- to the first game image;
+- to the title menu.
+
+**A long black screen does not necessarily mean a crash.** IOP reset and USB driver start-up happen before anything is drawn, and USB reads on a console may be much slower than in PCSX2. There is no fixed timeout. Keep the stopwatch running, note when (or whether) the start-up list appears, and note its last line if it stops.
+
+PCSX2 reference (host files, not USB; it excludes IOP reset and driver loading, which come before the game's own clock starts):
+- the game reports `MILESTONE first frame presented at 4.5 s after boot`;
+- the title menu (`STATE gamestate=1`) follows at about 9 s.
+
+On the console, compare the same two log lines with your stopwatch times.
+
+**Audio, listening:**
+- Does music play continuously?
+- Any buzzing, a short fragment repeating, or crackling? When: on a room change, while saving, while music changes, at random?
+- Does it coincide with USB activity (save, music track change, first entry into an area)?
+
+**From the overlay or log (P3.4 build):**
+- `AUDSRV Q` minimum;
+- `SUBMIT` gap and `late` count;
+- `DRY EST` (and `starved?` from the log);
+- `PCM UR` (music decoder underruns).
+
+**Crashes:**
+- Did a CPU EXCEPTION screen appear?
+- Did it show a red "second exception" line?
+- Did the console hang without a screen? If so, how long after start-up, and doing what?
+- Photograph every screen whole.
+
 ## 5. Getting the files back (after each session)
 
 1. Power off the console normally; do not pull the stick while a game runs. The log is written about every 10 s on USB, so the last seconds before a crash may be missing.
@@ -227,7 +288,8 @@ Any TPS is acceptable for the baseline: the point is to measure it.
 |---|---|
 | `mass:/` empty or missing | Stick FAT32 + MBR? Front port, inserted before power-on? Try another (smaller/older) stick |
 | `fs_smoke` PROBLEMS | Photograph the failed checks. CRC failures mean a bad copy: re-copy and re-run `sha256sum -c MANIFEST.sha256` |
-| Black screen after launch | Wait 30 s; note whether wLaunchELF itself was visible; NTSC 60 Hz needs a TV/cable that accepts it |
+| Black screen after launch | Not necessarily a crash: IOP reset and USB start-up come first and may be slow. Time it, and note how long you waited before resetting; note whether wLaunchELF itself was visible; NTSC 60 Hz needs a TV/cable that accepts it |
+| Buzz or a short sound repeating | audsrv ran dry (the IOP replays its old buffer). Note what was happening; in the P3.4 build photograph the DIAG page (`late`, `DRY EST`) |
 | Start-up list stops | Note the last line; that is the step that hangs |
 | FATAL ERROR / CPU EXCEPTION | Photograph it whole; note the build ID on it; reset |
 | Wrong build ID on screen | Wrong folder; start again from the right one |

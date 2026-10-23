@@ -1,6 +1,6 @@
 --- a/desktop_version/src/PS2Platform.h
 +++ b/desktop_version/src/PS2Platform.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,62 @@
 +#ifndef PS2PLATFORM_H
 +#define PS2PLATFORM_H
 +
@@ -35,6 +35,26 @@
 +void PS2_LogDefer(int defer);
 +void PS2_LogFlushNow(void); /* synchronous; for the fatal screen */
 +void PS2_LogWriteStats(uint32_t *ok, uint32_t *failed); /* log file writes so far */
++/* P3.4: audsrv's IOP ring at each audio submission (SDL patch 0009),
++ * collected once per loop; each consumer has its own window. Depths are in
++ * milliseconds of audio before a submission. See docs/ps2-hardware-diagnostics.md. */
++typedef struct
++{
++    uint32_t samples;       /* submissions in this window */
++    uint32_t min_queued_ms; /* lowest depth (UINT32_MAX: no samples) */
++    uint32_t max_gap_us;    /* longest interval between submissions */
++    uint32_t max_call_us;   /* longest audsrv_play_audio call */
++    uint32_t late, starved; /* new late / suspected-starved submissions */
++    uint32_t dry_ms;        /* estimated dry time (late submissions, by the clock) */
++} PS2AudsrvWindow;
++enum { PS2_AUDSRV_OVERLAY, PS2_AUDSRV_BENCH, PS2_AUDSRV_LOG, PS2_AUDSRV_CONSUMERS };
++void PS2_AudsrvTake(int consumer, PS2AudsrvWindow *w); /* returns the window and starts a new one */
++typedef struct
++{
++    int active;           /* 0: no submission yet, or stats off */
++    uint32_t submits, queued_ms, late, dry_ms, starved, short_writes, max_query_us, lost_samples;
++} PS2AudsrvTotals;
++void PS2_AudsrvTotals(PS2AudsrvTotals *t); /* since boot; queued_ms: the last submission */
 +int PS2_OnRealStorage(void); /* not PCSX2/ps2link host: */
 +void PS2_Snapshot(const char *tag);
 +
@@ -45,7 +65,7 @@
 +#endif /* PS2PLATFORM_H */
 --- a/desktop_version/src/PS2Platform.cpp
 +++ b/desktop_version/src/PS2Platform.cpp
-@@ -0,0 +1,658 @@
+@@ -0,0 +1,839 @@
 +#include "PS2Platform.h"
 +
 +#include <SDL.h>
@@ -84,7 +104,9 @@
 + * exists. See docs/ps2-p3-report.md, hardware readiness. */
 +static bool on_real_storage;
 +static bool snapshots_enabled = true;
-+static bool crash_test;
++enum { CRASH_OFF, CRASH_TRAP, CRASH_BADSP, CRASH_NESTED };
++static int crash_test; /* crashtest.txt, TEST ONLY */
++static bool audio_stall_test; /* audiostall.txt, TEST ONLY */
 +static uint32_t render_since_loop; /* render time inside the current loop */
 +static char log_copy[PS2_LOG_SIZE];
 +static size_t log_copy_len;
@@ -412,19 +434,43 @@
 +        }
 +        /* crashtest.txt: TEST ONLY - a trap exception after ~20 s of frames
 +         * to check that the exception screen appears (a trap rather than an
-+         * unaligned access: PCSX2 does not raise address errors) */
-+        fd = open("crashtest.txt", O_RDONLY);
++         * unaligned access: PCSX2 does not raise address errors). Content:
++         *   badsp  - $sp is pointed outside RAM first (the report must not
++         *            use the faulting stack);
++         *   nested - the report itself traps once (bounded fallback);
++         *   anything else - a plain trap. */
++        /* audiostall.txt: TEST ONLY - from ~20 s on, every ~10 s, hold the SDL
++         * audio device lock for a growing time, so the audio thread misses
++         * submissions; checks the audsrv late/starved counters (P3.4) */
++        fd = open("audiostall.txt", O_RDONLY);
 +        if (fd >= 0)
 +        {
 +            close(fd);
-+            crash_test = true;
-+            PS2_LogNow("crashtest.txt present: a deliberate CPU exception will follow");
++            audio_stall_test = true;
++            PS2_LogNow("audiostall.txt present: the audio thread will be stalled on purpose");
++        }
++        fd = open("crashtest.txt", O_RDONLY);
++        if (fd >= 0)
++        {
++            char mode[16] = {0};
++            read(fd, mode, sizeof(mode) - 1);
++            close(fd);
++            crash_test = SDL_strncmp(mode, "badsp", 5) == 0 ? CRASH_BADSP
++                       : SDL_strncmp(mode, "nested", 6) == 0 ? CRASH_NESTED : CRASH_TRAP;
++            if (crash_test == CRASH_NESTED)
++            {
++                PS2Diag_CrashTestNested();
++            }
++            PS2_LogNow("crashtest.txt present (%s): a deliberate CPU exception will follow",
++                       crash_test == CRASH_BADSP ? "badsp" : crash_test == CRASH_NESTED ? "nested" : "trap");
 +        }
 +    }
 +    /* P3 optimisations; all on unless bench.txt says opts=... (A/B runs) */
 +    SDL_SetHint("SDL_PS2_P3_FASTPATHS", (ps2_opts & PS2_OPT_SDL_FASTPATHS) ? "1" : "0");
 +    /* P3.1: flipped copies (flip mode text and frame) without per-call surfaces */
 +    SDL_SetHint("SDL_SW_FLIP_FASTPATH", (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "1" : "0");
++    /* P3.4: audsrv queue sampling on the SDL audio thread */
++    SDL_SetHint("SDL_PS2_AUDSRV_STATS", (ps2_opts & PS2_OPT_AUDSRV_STATS) ? "1" : "0");
 +    PS2_LogNow("render opts=0x%lx: P3 SDL fast paths %s, flip fast path %s", (unsigned long) ps2_opts,
 +               (ps2_opts & PS2_OPT_SDL_FASTPATHS) ? "on" : "off", (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "on" : "off");
 +#ifdef VVV_MUSIC_STREAMING
@@ -576,9 +622,98 @@
 +}
 +#endif
 +
++/* ---- P3.4: audsrv submissions (SDL patch 0009; read-only here, no RPC) ---- */
++extern "C" {
++#define PS2AUDIO_STAT_SAMPLES 64
++typedef struct
++{
++    uint16_t queued, call_us;
++    uint32_t gap_us;
++} SDL_PS2AudioSample;
++typedef struct
++{
++    volatile uint32_t submits;
++    uint32_t bytes_per_second, submit_bytes, starved, late, short_writes, max_query_us, dry_us;
++    SDL_PS2AudioSample s[PS2AUDIO_STAT_SAMPLES];
++} SDL_PS2AudioStats;
++extern SDL_PS2AudioStats SDL_ps2_audio_stats;
++}
++struct AudsrvAcc
++{
++    uint32_t samples, min_queued, max_gap_us, max_call_us, late0, starved0, dry0_us;
++};
++static AudsrvAcc audsrv_acc[PS2_AUDSRV_CONSUMERS];
++static uint32_t audsrv_seen, audsrv_lost, audsrv_last_queued;
++
++static void audsrv_poll(void)
++{
++    const SDL_PS2AudioStats *st = &SDL_ps2_audio_stats;
++    const uint32_t end = st->submits;
++    /* the slot the writer fills next may be torn: read at most 63 back */
++    if (end - audsrv_seen > PS2AUDIO_STAT_SAMPLES - 1)
++    {
++        audsrv_lost += end - audsrv_seen - (PS2AUDIO_STAT_SAMPLES - 1);
++        audsrv_seen = end - (PS2AUDIO_STAT_SAMPLES - 1);
++    }
++    for (; audsrv_seen != end; audsrv_seen++)
++    {
++        const SDL_PS2AudioSample &smp = st->s[audsrv_seen % PS2AUDIO_STAT_SAMPLES];
++        audsrv_last_queued = smp.queued;
++        for (int c = 0; c < PS2_AUDSRV_CONSUMERS; c++)
++        {
++            AudsrvAcc &a = audsrv_acc[c];
++            if (a.samples++ == 0 || smp.queued < a.min_queued)
++                a.min_queued = smp.queued;
++            if (smp.gap_us > a.max_gap_us)
++                a.max_gap_us = smp.gap_us;
++            if (smp.call_us > a.max_call_us)
++                a.max_call_us = smp.call_us;
++        }
++    }
++}
++
++static uint32_t audsrv_bytes_to_ms(uint32_t bytes)
++{
++    const uint32_t bps = SDL_ps2_audio_stats.bytes_per_second;
++    return bps ? (uint32_t) ((uint64_t) bytes * 1000 / bps) : 0;
++}
++
++void PS2_AudsrvTake(int consumer, PS2AudsrvWindow *w)
++{
++    AudsrvAcc &a = audsrv_acc[consumer];
++    const uint32_t late = SDL_ps2_audio_stats.late, starved = SDL_ps2_audio_stats.starved;
++    const uint32_t dry_us = SDL_ps2_audio_stats.dry_us;
++    w->samples = a.samples;
++    w->min_queued_ms = a.samples ? audsrv_bytes_to_ms(a.min_queued) : UINT32_MAX;
++    w->max_gap_us = a.max_gap_us;
++    w->max_call_us = a.max_call_us;
++    w->late = late - a.late0;
++    w->starved = starved - a.starved0;
++    w->dry_ms = (dry_us - a.dry0_us) / 1000;
++    a = AudsrvAcc();
++    a.late0 = late;
++    a.starved0 = starved;
++    a.dry0_us = dry_us;
++}
++
++void PS2_AudsrvTotals(PS2AudsrvTotals *t)
++{
++    const SDL_PS2AudioStats &st = SDL_ps2_audio_stats;
++    t->active = st.submits != 0;
++    t->submits = st.submits;
++    t->queued_ms = audsrv_bytes_to_ms(audsrv_last_queued);
++    t->late = st.late;
++    t->dry_ms = st.dry_us / 1000;
++    t->starved = st.starved;
++    t->short_writes = st.short_writes;
++    t->max_query_us = st.max_query_us;
++    t->lost_samples = audsrv_lost;
++}
++
 +void PS2_LoopBegin(void)
 +{
 +    uint64_t now = PS2_NowUs();
++    audsrv_poll();
 +    while (PS2Diag_Halted())
 +    {
 +        /* an exception/fatal screen is up (possibly reported from another
@@ -605,6 +740,47 @@
 +    return (x > y) - (x < y);
 +}
 +
++static void audio_stall_step(void)
++{
++    static const uint32_t stall_ms[] = {20, 60, 85, 100, 150, 300};
++    static PS2AudsrvTotals before;
++    static int pending = -1;
++    const uint32_t k = n_loops >= 600 && (n_loops - 600) % 300 == 0 ? (n_loops - 600) / 300 : 999;
++    if (pending >= 0 && (k != 999 || (n_loops - 600) % 300 == 60))
++    {
++        PS2AudsrvTotals after;
++        PS2_AudsrvTotals(&after);
++        PS2_Log("AUDIOSTALL %lu ms: late +%lu, dry est +%lu ms, starved? +%lu, short +%lu, lost samples +%lu",
++                (unsigned long) stall_ms[pending], (unsigned long) (after.late - before.late),
++                (unsigned long) (after.dry_ms - before.dry_ms),
++                (unsigned long) (after.starved - before.starved),
++                (unsigned long) (after.short_writes - before.short_writes),
++                (unsigned long) (after.lost_samples - before.lost_samples));
++        pending = -1;
++    }
++    if (k >= SDL_arraysize(stall_ms))
++        return;
++    PS2_AudsrvTotals(&before);
++    SDL_AudioDeviceID locked[8];
++    int n = 0;
++    for (SDL_AudioDeviceID id = 1; id <= 8; id++)
++    {
++        if (SDL_GetAudioDeviceStatus(id) != SDL_AUDIO_STOPPED)
++        {
++            SDL_LockAudioDevice(id);
++            locked[n++] = id;
++        }
++    }
++    const uint64_t t0 = PS2_NowUs();
++    while (PS2_NowUs() - t0 < stall_ms[k] * 1000ull)
++    {
++    }
++    for (int i = 0; i < n; i++)
++        SDL_UnlockAudioDevice(locked[i]);
++    PS2_Log("AUDIOSTALL held %d audio device lock(s) for %lu ms", n, (unsigned long) stall_ms[k]);
++    pending = (int) k;
++}
++
 +void PS2_LoopEnd(void)
 +{
 +    uint32_t work = (uint32_t) (PS2_NowUs() - loop_t0);
@@ -615,11 +791,20 @@
 +    if (crash_test && n_loops == 600)
 +    {
 +        PS2_LogFlushNow();
++        if (crash_test == CRASH_BADSP)
++        {
++            /* $sp outside the 32 MB of RAM, then a trap; never returns */
++            __asm__ volatile("lui $sp, 0x0280\n\tteq $0, $0");
++        }
 +        __asm__ volatile("teq $0, $0"); /* trap exception (code 13) */
 +    }
 +#ifdef VVV_MUSIC_STREAMING
 +    music_soak_step();
 +#endif
++    if (audio_stall_test)
++    {
++        audio_stall_step();
++    }
 +    PS2Bench_LoopEnd();
 +
 +#ifdef VVV_MUSIC_STREAMING
@@ -699,6 +884,22 @@
 +            MUSIC_ResetStreamMinFill();
 +        }
 +#endif
++        {
++            PS2AudsrvWindow w;
++            PS2AudsrvTotals t;
++            PS2_AudsrvTake(PS2_AUDSRV_LOG, &w);
++            PS2_AudsrvTotals(&t);
++            char mn[16];
++            SDL_snprintf(mn, sizeof(mn), w.samples ? "%lu" : "n/a", (unsigned long) w.min_queued_ms);
++            PS2_Log("AUDSRV q now=%lu min=%s ms | gap max=%lu us | play call max=%lu us, queued() call max=%lu us | "
++                    "submits=%lu (+%lu) late=%lu (+%lu) dry est=%lu ms (+%lu) starved?=%lu (+%lu) short=%lu lost samples=%lu",
++                    (unsigned long) t.queued_ms, mn, (unsigned long) w.max_gap_us, (unsigned long) w.max_call_us,
++                    (unsigned long) t.max_query_us, (unsigned long) t.submits, (unsigned long) w.samples,
++                    (unsigned long) t.late, (unsigned long) w.late, (unsigned long) t.dry_ms,
++                    (unsigned long) w.dry_ms, (unsigned long) t.starved,
++                    (unsigned long) w.starved, (unsigned long) t.short_writes, (unsigned long) t.lost_samples);
++            PS2Diag_LogState();
++        }
 +        sum_period = sum_work = sum_render = 0;
 +        max_period = max_work = max_render = 0;
 +        n_renders = 0;
@@ -706,7 +907,7 @@
 +}
 --- a/desktop_version/src/PS2Bench.h
 +++ b/desktop_version/src/PS2Bench.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,54 @@
 +#ifndef PS2BENCH_H
 +#define PS2BENCH_H
 +
@@ -730,6 +931,7 @@
 +#define PS2_OPT_WINDOW_CLEARS 0x4u  /* skip window clears that render() overwrites anyway */
 +#define PS2_OPT_OPAQUE_SCROLL 0x8u  /* no effect: those targets are already blend NONE (P3.1) */
 +#define PS2_OPT_FLIP_FASTPATH 0x10u /* SDL_SW_FLIP_FASTPATH (SDL patch 0008, P3.1) */
++#define PS2_OPT_AUDSRV_STATS 0x20u  /* SDL_PS2_AUDSRV_STATS (SDL patch 0009, P3.4) */
 +#define PS2_OPT_ALL 0xffffffffu
 +extern uint32_t ps2_opts;
 +/* SDL patch 0008: how flipped copies were done (counts since boot) */
@@ -762,7 +964,7 @@
 +#endif /* PS2BENCH_H */
 --- a/desktop_version/src/PS2Bench.cpp
 +++ b/desktop_version/src/PS2Bench.cpp
-@@ -0,0 +1,984 @@
+@@ -0,0 +1,997 @@
 +#include "PS2Bench.h"
 +
 +#include <SDL.h>
@@ -1088,7 +1290,9 @@
 +    }
 +    result_line("# VVVVVV PS2 benchmark, build %s: settle=%d s measure=%d s over30=%d opts=0x%lx overlay=%d flip=%d\n"
 +                "# times in ms; tps = logic ticks per second (full speed %.1f); tps_min = slowest 1 s window\n"
-+                "# scene            tps   tps_min frame  p95    p99    max    render underruns mem_MiB\n",
++                "# underruns = music (Vorbis PCM ring); aq_min = lowest audsrv queue in ms (-1: n/a); late, dry_ms (estimated,\n"
++                "# by the clock) and starved? (queue-based, weak) = audsrv submissions; docs/ps2-hardware-diagnostics.md\n"
++                "# scene            tps   tps_min frame  p95    p99    max    render underruns mem_MiB aq_min  late dry_ms starved?\n",
 +                PS2Diag_BuildId(), cfg_settle_s, cfg_measure_s, cfg_over30, (unsigned long) ps2_opts, cfg_overlay, cfg_flip,
 +                1000.0 / 34);
 +    PS2_Log("BENCH enabled: settle=%d measure=%d over30=%d profile=%d verify=%d opts=0x%lx flip=%d tag=%s scenes=%s",
@@ -1369,9 +1573,16 @@
 +    }
 +#endif
 +    PS2_Log("BENCH scene=%s tps min over 1 s windows: %.1f", name, tps_min);
-+    result_line("%-17s %5.1f %6.1f %6.2f %6.2f %6.2f %6.2f %6.2f %6ld %7.2f\n", name, ticks / secs, tps_min,
++    PS2AudsrvWindow aw;
++    PS2_AudsrvTake(PS2_AUDSRV_BENCH, &aw);
++    const long aq_min = aw.samples ? (long) aw.min_queued_ms : -1;
++    PS2_Log("BENCH scene=%s audsrv: submissions=%lu queue min=%ld ms gap max=%lu us play call max=%lu us late=%lu dry est=%lu ms starved?=%lu",
++            name, (unsigned long) aw.samples, aq_min, (unsigned long) aw.max_gap_us, (unsigned long) aw.max_call_us,
++            (unsigned long) aw.late, (unsigned long) aw.dry_ms, (unsigned long) aw.starved);
++    result_line("%-17s %5.1f %6.1f %6.2f %6.2f %6.2f %6.2f %6.2f %6ld %7.2f %6ld %5lu %6lu %8lu\n", name, ticks / secs, tps_min,
 +                period.mean / 1000, period.p95 / 1000.0, period.p99 / 1000.0, period.max / 1000.0, rend.mean / 1000,
-+                scene_underruns, mi.uordblks / 1048576.0);
++                scene_underruns, mi.uordblks / 1048576.0, aq_min, (unsigned long) aw.late, (unsigned long) aw.dry_ms,
++                (unsigned long) aw.starved);
 +    {
 +        /* copies by kind during the scene, largest pixel counts first */
 +        int order[24], n = 0;
@@ -1591,6 +1802,10 @@
 +    n_frames = 0;
 +    sw_scene0 = SW_render_stats;
 +    flip_scene0 = SDL_sw_flip_stats;
++    {
++        PS2AudsrvWindow aw; /* restart the audsrv window with the measurement */
++        PS2_AudsrvTake(PS2_AUDSRV_BENCH, &aw);
++    }
 +    tower_redraws0 = ps2_tower_full_redraws;
 +#ifdef VVV_MUSIC_STREAMING
 +    StreamStats ms;
@@ -1749,7 +1964,7 @@
 +}
 --- a/desktop_version/src/PS2Diag.h
 +++ b/desktop_version/src/PS2Diag.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,54 @@
 +#ifndef PS2DIAG_H
 +#define PS2DIAG_H
 +
@@ -1790,7 +2005,10 @@
 +void PS2Diag_SetOverlay(int mode); /* PS2DIAG_OVERLAY_* (L3+R3 cycles them in this order) */
 +void PS2Diag_SetStatus(const char *text); /* shown on the overlay's last line when there is no error */
 +int PS2Diag_OverlayOn(void);           /* the current mode, 0 when hidden */
++void PS2Diag_LogState(void);           /* renderer and flip counters, into the log */
 +
++/* TEST ONLY (crashtest.txt "nested"): fault once more inside the exception report */
++void PS2Diag_CrashTestNested(void);
 +/* set once a fatal/exception screen owns the display; the main loop then stops */
 +int PS2Diag_Halted(void);
 +/* build identity shown on every diagnostic screen and in the log */
@@ -1803,7 +2021,7 @@
 +#endif /* PS2DIAG_H */
 --- a/desktop_version/src/PS2Diag.cpp
 +++ b/desktop_version/src/PS2Diag.cpp
-@@ -0,0 +1,765 @@
+@@ -0,0 +1,896 @@
 +#include "PS2Diag.h"
 +
 +#include <SDL.h>
@@ -1963,9 +2181,64 @@
 +
 +/* The handler runs in exception context, where the kernel calls libdebug
 + * needs (SetGsCrt, FlushCache) are not allowed: it only saves the registers
-+ * and resumes the faulting thread in exception_report(). */
++ * and resumes the faulting thread in exception_report().
++ *
++ * Stacks (P3.4). libeedebug's level-1 vector already switches $sp to its own
++ * 8 KB stack before it saves the frame and calls exception_screen(), so the
++ * code below never touches the faulting thread's stack. On return its
++ * _ee_load_frame reloads every GPR from the frame (including sp, gp, s8, ra)
++ * and executes eret, so the resumed context is exactly what the frame holds:
++ * the report gets a private stack by rewriting frame->sp, not by moving $sp
++ * in C. The original registers stay in saved_frame for the report.
++ *
++ * After eret the CPU runs in the faulting thread's own context (the kernel
++ * did not switch threads), the same context exception_report() has always
++ * ended in with SleepThread(). A fault inside an interrupt handler would
++ * resume in that context instead; that case is not handled. */
 +static EE_RegFrame saved_frame;
 +static void save_text_screen(const char *name);
++
++#define EXC_STACK_SIZE (16 * 1024)
++#define PARK_STACK_SIZE 512
++static uint8_t exc_stack[EXC_STACK_SIZE] __attribute__((aligned(64)));
++/* parked threads only ever call SleepThread(); they may share it */
++static uint8_t park_stack[PARK_STACK_SIZE] __attribute__((aligned(64)));
++
++/* written in exception context, read by the report */
++static volatile int exc_entered;
++static volatile int report_stage; /* REPORT_* reached by exception_report */
++static volatile bool fallback_used;
++static volatile uint32_t nested_count, nested_code, nested_epc, nested_badvaddr;
++static volatile bool crashtest_nested; /* TEST ONLY: fault once inside the report */
++enum { REPORT_NONE, REPORT_SERIAL, REPORT_SCREEN, REPORT_LOG, REPORT_FLUSH, REPORT_DONE };
++static const char *const report_stage_names[] = {"none", "serial", "screen", "log", "flush", "done"};
++
++static bool in_exc_stack(uint32_t sp)
++{
++    return sp > (uint32_t) (uintptr_t) exc_stack && sp <= (uint32_t) (uintptr_t) (exc_stack + EXC_STACK_SIZE);
++}
++
++/* resume the faulting thread at fn, on the given stack, with a sane gp and
++ * no return address or frame pointer (stack walks stop there) */
++static void resume_at(EE_RegFrame *frame, void (*fn)(void), uint8_t *stack, size_t size)
++{
++    const uint32_t top = ((uint32_t) (uintptr_t) (stack + size) & ~15u) - 64;
++    frame->epc = (u32) (uintptr_t) fn;
++    frame->sp[0] = top;
++    frame->sp[1] = 0; /* lq loads 128 bits; the low 64 must be the sign-extended address */
++    frame->gp[0] = (u32) (uintptr_t) &_gp; /* linker symbol (kernel.h): its address is the gp value */
++    frame->gp[1] = 0;
++    frame->fp[0] = frame->fp[1] = 0;
++    frame->ra[0] = frame->ra[1] = 0;
++}
++
++static void exception_park(void)
++{
++    for (;;)
++    {
++        SleepThread();
++    }
++}
 +
 +static void exception_report(void)
 +{
@@ -1973,9 +2246,11 @@
 +    halted = 1; /* the main loop stops at its next iteration, so it cannot draw over this */
 +    const unsigned code = (frame->cause >> 2) & 31;
 +    char text[96];
-+    SDL_snprintf(text, sizeof(text), "VVVVVV PS2 exception screen: code %u EPC %08x BadVAddr %08x RA %08x",
-+                 code, (unsigned) frame->epc, (unsigned) frame->badvaddr, (unsigned) frame->ra[0]);
++    report_stage = REPORT_SERIAL;
++    SDL_snprintf(text, sizeof(text), "VVVVVV PS2 exception screen: code %u EPC %08x BadVAddr %08x RA %08x SP %08x",
++                 code, (unsigned) frame->epc, (unsigned) frame->badvaddr, (unsigned) frame->ra[0], (unsigned) frame->sp[0]);
 +    sio_puts(text); /* EE serial console; PCSX2 shows it in its log */
++    report_stage = REPORT_SCREEN;
 +    init_scr();
 +    scr_setCursor(0);
 +    screen_reset();
@@ -1996,33 +2271,72 @@
 +    text_at(10, YELLOW, "Please photograph this screen, then reset the console.");
 +    text_at(11, YELLOW, "(EPC/RA can be looked up in the unstripped VVVVVV.elf)");
 +    screen_show();
-+    PS2_Log("EXCEPTION %s code %u EPC %08x BadVAddr %08x RA %08x", exception_name(code), code,
-+            (unsigned) frame->epc, (unsigned) frame->badvaddr, (unsigned) frame->ra[0]);
++    report_stage = REPORT_LOG;
++    if (crashtest_nested)
++    {
++        crashtest_nested = false;
++        __asm__ volatile("teq $0, $0"); /* TEST ONLY (crashtest.txt "nested") */
++    }
++    PS2_Log("EXCEPTION %s code %u EPC %08x BadVAddr %08x RA %08x SP %08x (report on its own stack)",
++            exception_name(code), code, (unsigned) frame->epc, (unsigned) frame->badvaddr,
++            (unsigned) frame->ra[0], (unsigned) frame->sp[0]);
 +    if (!PS2_OnRealStorage())
 +    {
 +        save_text_screen("shot_exception.ppm");
 +    }
++    report_stage = REPORT_FLUSH;
 +    PS2_LogFlushNow();
-+    for (;;)
++    report_stage = REPORT_DONE;
++    exception_park();
++}
++
++/* A fault inside exception_report: one short report, then park. Serial
++ * output always; one line on the screen only if the report got past
++ * setting it up (the fault may have been in the GS code). No log file. */
++static void exception_report_fallback(void)
++{
++    char text[96];
++    SDL_snprintf(text, sizeof(text), "VVVVVV PS2: second exception (code %u EPC %08x BadVAddr %08x) during report stage %s",
++                 (unsigned) nested_code, (unsigned) nested_epc, (unsigned) nested_badvaddr,
++                 report_stage_names[report_stage]);
++    sio_puts(text);
++    if (report_stage > REPORT_SCREEN)
 +    {
-+        SleepThread();
++        text_at(13, RED, text);
++        show_row(13);
 +    }
++    exception_park();
 +}
 +
 +static int exception_screen(EE_RegFrame *frame)
 +{
-+    static int entered;
-+    if (entered++)
++    if (exc_entered++ == 0)
 +    {
-+        /* a second fault (e.g. while reporting the first): keep the first
-+         * report; park this thread where it faulted */
-+        for (;;)
-+        {
-+        }
++        memcpy(&saved_frame, frame, sizeof(saved_frame)); /* original sp, gp, ra included */
++        resume_at(frame, exception_report, exc_stack, EXC_STACK_SIZE);
++        return 1;
 +    }
-+    memcpy(&saved_frame, frame, sizeof(saved_frame));
-+    frame->epc = (u32) (uintptr_t) exception_report;
++    /* a second fault: keep the first report's data. No syscalls here. */
++    nested_count++;
++    nested_code = (frame->cause >> 2) & 31;
++    nested_epc = frame->epc;
++    nested_badvaddr = frame->badvaddr;
++    if (in_exc_stack(frame->sp[0]) && !fallback_used)
++    {
++        /* the report itself faulted: one bounded fallback, never a restart */
++        fallback_used = true;
++        resume_at(frame, exception_report_fallback, exc_stack, EXC_STACK_SIZE);
++        return 1;
++    }
++    /* another thread, or the fallback faulted too: park it in thread
++     * context (spinning here, with EXL set, would stop every thread) */
++    resume_at(frame, exception_park, park_stack, PARK_STACK_SIZE);
 +    return 1;
++}
++
++void PS2Diag_CrashTestNested(void)
++{
++    crashtest_nested = true;
 +}
 +
 +static void install_exception_screen(void)
@@ -2219,6 +2533,7 @@
 +{
 +    uint32_t us, ticks, loops, renders, max_period;
 +    uint64_t period, render, decode;
++    uint32_t aq_min_ms, aq_max_gap_us; /* audsrv (P3.4); aq_min_ms UINT32_MAX: no samples */
 +} Bucket;
 +
 +static int overlay_mode;
@@ -2299,6 +2614,17 @@
 +    return buf;
 +}
 +
++static const char *renderer_name(void);
++/* every 10 s from the frame report: what the DIAG page no longer shows */
++void PS2Diag_LogState(void)
++{
++    const SDL_SWFlipStats &fs = SDL_sw_flip_stats;
++    PS2_Log("DIAG renderer=%s flipmode=%d flip fastpath=%s | flipped fast=%lu fallback=%lu scratch allocs=%lu (failed %lu)",
++            renderer_name(), (int) graphics.flipmode, (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "on" : "off",
++            (unsigned long) fs.fast, (unsigned long) fs.fallback, (unsigned long) fs.scratch_allocs,
++            (unsigned long) fs.scratch_alloc_failures);
++}
++
 +static const char *renderer_name(void)
 +{
 +    static char name[12];
@@ -2330,6 +2656,12 @@
 +    cur.decode = ms.decode_us_total - decode0;
 +    decode0 = ms.decode_us_total;
 +#endif
++    {
++        PS2AudsrvWindow aw;
++        PS2_AudsrvTake(PS2_AUDSRV_OVERLAY, &aw);
++        cur.aq_min_ms = aw.min_queued_ms;
++        cur.aq_max_gap_us = aw.max_gap_us;
++    }
 +    hist[hist_i] = cur;
 +    hist_i = (hist_i + 1) % BUCKETS;
 +    if (hist_n < BUCKETS)
@@ -2349,7 +2681,7 @@
 +    double decode = 0;
 +#endif
 +    uint64_t ticks = 0, us = 0;
-+    uint32_t mx = 0;
++    uint32_t mx = 0, aq_min = UINT32_MAX, aq_gap = 0;
 +    if (have1)
 +    {
 +        tps = (n0.ticks + n1.ticks) * 1e6 / (double) (n0.us + n1.us);
@@ -2365,6 +2697,8 @@
 +        ticks += h.ticks;
 +        us += h.us;
 +        mx = h.max_period > mx ? h.max_period : mx;
++        aq_min = h.aq_min_ms < aq_min ? h.aq_min_ms : aq_min;
++        aq_gap = h.aq_max_gap_us > aq_gap ? h.aq_max_gap_us : aq_gap;
 +        /* MIN over every 1 s window (adjacent buckets) inside the 10 s */
 +        if (i != hist_i && (hist_n == BUCKETS || i > 0))
 +        {
@@ -2380,9 +2714,9 @@
 +    {
 +#ifdef VVV_MUSIC_STREAMING
 +        if (have1)
-+            SDL_snprintf(compact, sizeof(compact), "TPS %4.1f XRUN %lu HEAP %.1fM", tps, (unsigned long) ms.underruns, heap);
++            SDL_snprintf(compact, sizeof(compact), "TPS %4.1f PCM %lu HEAP %.1fM", tps, (unsigned long) ms.underruns, heap);
 +        else
-+            SDL_snprintf(compact, sizeof(compact), "TPS --.- XRUN %lu HEAP %.1fM", (unsigned long) ms.underruns, heap);
++            SDL_snprintf(compact, sizeof(compact), "TPS --.- PCM %lu HEAP %.1fM", (unsigned long) ms.underruns, heap);
 +#else
 +        if (have1)
 +            SDL_snprintf(compact, sizeof(compact), "TPS %4.1f HEAP %.1fM", tps, heap);
@@ -2410,7 +2744,7 @@
 +        else
 +            set_row(3, "RENDER", 160, 160, 160, "N/A");
 +#ifdef VVV_MUSIC_STREAMING
-+        set_row(4, "MUSIC", 255, ms.underruns ? 128 : 255, ms.underruns ? 128 : 255, "%s  %3.0f ms/s  XRUN %lu",
++        set_row(4, "MUSIC", 255, ms.underruns ? 128 : 255, ms.underruns ? 128 : 255, "%s  %3.0f ms/s  PCM UR %lu",
 +                ms.active ? "on " : "off", decode, (unsigned long) ms.underruns);
 +#else
 +        set_row(4, "MUSIC", 160, 160, 160, "off (no-music build)");
@@ -2423,14 +2757,29 @@
 +        PS2_LogWriteStats(&ok, &failed);
 +        const SDL_SWFlipStats &fs = SDL_sw_flip_stats;
 +        SDL_snprintf(header, sizeof(header), "%.18s", VVV_PS2_BUILD_ID);
-+        set_row(0, "RENDERER", 255, 255, 255, "SDL %.8s", renderer_name());
-+        set_row(1, "FLIP MODE", 255, 255, 255, "%-3s  FASTPATH %s", graphics.flipmode ? "on" : "off",
-+                (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "on" : "off");
-+        set_row(2, "FLIPPED", 255, 255, 255, "fast %s  old %s", count(a, fs.fast), count(b, fs.fallback));
-+        set_row(3, "SCRATCH", 255, 255, 255, "%lu allocs  %lu failed", (unsigned long) fs.scratch_allocs,
-+                (unsigned long) fs.scratch_alloc_failures);
-+        set_row(4, "STORAGE", failed ? 255 : 255, failed ? 200 : 255, failed ? 64 : 255, "%s  log ok %lu fail %lu",
++        PS2AudsrvTotals at;
++        PS2_AudsrvTotals(&at);
++        /* renderer name, fast-path switch and scratch counters: in the log (PS2Diag_LogState) */
++        set_row(0, "FLIP MODE", 255, 255, 255, "%-3s  fast %s  old %s", graphics.flipmode ? "on" : "off",
++                count(a, fs.fast), count(b, fs.fallback));
++        set_row(1, "STORAGE", failed ? 255 : 255, failed ? 200 : 255, failed ? 64 : 255, "%s  log ok %lu fail %lu",
 +                PS2_OnRealStorage() ? "USB" : "host", (unsigned long) ok, (unsigned long) failed);
++        if (at.active && aq_min != UINT32_MAX)
++            set_row(2, "AUDSRV Q", 255, 255, 255, "%3lu ms  min %3lu ms", (unsigned long) at.queued_ms,
++                    (unsigned long) aq_min);
++        else
++            set_row(2, "AUDSRV Q", 160, 160, 160, "N/A");
++        if (at.active && aq_min != UINT32_MAX)
++            set_row(3, "SUBMIT", 255, at.late ? 200 : 255, at.late ? 64 : 255, "gap %3lu ms  late %s",
++                    (unsigned long) (aq_gap / 1000), count(a, at.late));
++        else
++            set_row(3, "SUBMIT", 160, 160, 160, "N/A");
++        /* clock-based; the log also has starved? (queue-based, weak) */
++        if (at.active)
++            set_row(4, "DRY EST", 255, at.dry_ms ? 200 : 255, at.dry_ms ? 64 : 255, "%lu ms (by clock)",
++                    (unsigned long) at.dry_ms);
++        else
++            set_row(4, "DRY EST", 160, 160, 160, "N/A");
 +        if (last_error[0])
 +            set_row(5, "LAST ERR", 255, 200, 64, "%.24s", last_error);
 +        else

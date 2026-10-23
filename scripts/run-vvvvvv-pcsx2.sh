@@ -14,6 +14,7 @@
 #   (EE PC samples, see scripts/ps2-profile.py) and frame_*.png are collected.
 #
 # - FLAG_FILES="overlay storage_real crashtest snapshots": create <name>.txt
+#   (<name>=<text> writes <text> into it, e.g. crashtest=badsp)
 #   next to the ELF (switches read at start-up, see docs/ps2-h1-hardware-readiness.md).
 # - PCSX2_OSD_FPS=1: PCSX2 on-screen FPS/VPS/speed overlay (in the window,
 #   not in the GS snapshots).
@@ -54,7 +55,7 @@ cp -r "$REPO/out/vvvvvv-ps2/." "$RUNDIR/"
 ln -sf "$(realpath "$DATA_ZIP")" "$RUNDIR/$(basename "$DATA_ZIP")"
 if [[ "${SOAK:-0}" == 1 ]]; then echo "scripted music soak test" > "$RUNDIR/music_soak.txt"; fi
 if [[ -n "${BENCH+x}" ]]; then printf '%s\n' ${BENCH} > "$RUNDIR/bench.txt"; fi
-for f in ${FLAG_FILES:-}; do echo "$f" > "$RUNDIR/$f.txt"; done
+for f in ${FLAG_FILES:-}; do echo "${f#*=}" > "$RUNDIR/${f%%=*}.txt"; done
 
 mkdir -p "$LOGS"
 rm -f "${LOGS:?}"/*

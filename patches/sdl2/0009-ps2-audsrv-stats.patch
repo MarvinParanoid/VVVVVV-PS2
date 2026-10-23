@@ -1,0 +1,137 @@
+--- a/src/audio/ps2/SDL_ps2audio.c
++++ b/src/audio/ps2/SDL_ps2audio.c
+@@ -22,6 +22,7 @@
+ 
+ /* Output audio to nowhere... */
+ 
++#include "SDL_hints.h"
+ #include "SDL_timer.h"
+ #include "SDL_audio.h"
+ #include "../SDL_audio_c.h"
+@@ -29,9 +30,63 @@
+ 
+ #include <kernel.h>
+ #include <malloc.h>
++#include <timer.h>
+ #include <audsrv.h>
+ #include <ps2_audio_driver.h>
+ 
++/* Diagnostics for the VVVVVV PS2 port (docs/ps2-hardware-diagnostics.md):
++ * the state of audsrv's IOP ring buffer at every submission. Not a public
++ * API; readers declare it extern, so linking them against an SDL without
++ * this patch fails.
++ *
++ * audsrv_queued() returns the bytes queued in the IOP ring, in the format set
++ * with audsrv_set_format (here: the device's). It is an RPC that shares one
++ * semaphore with audsrv_wait_audio(), which blocks on the IOP, so another
++ * thread calling it would stall until the audio thread's wait returns: it is
++ * only called here, on the audio thread, once per submission.
++ *
++ * audsrv's IOP player keeps consuming when the ring runs dry (it replays
++ * stale bytes, a buzz) and its read position overtakes the write position;
++ * queued() then reads high again. So underflow is detected from the
++ * sequence, not from the depth alone. Only this thread writes the ring, so
++ * between two submissions the depth can only fall:
++ *   late:    time since the previous submission > the audio that was
++ *            queued just after it (by the clock it must have run dry);
++ *            dry_us adds up the excess;
++ *   starved: depth now > depth just after the previous submission
++ *            (the reader passed the writer), or depth now == 0. Weak:
++ *            wait_audio keeps the ring nearly full, so after a dry-out
++ *            the wrapped depth usually still looks lower (P3.4 tests).
++ * Single writer; readers poll `submits` and read the samples it covers. */
++#define PS2AUDIO_STAT_SAMPLES 64 /* power of two; ~0.74 s at 512 frames/44.1 kHz */
++typedef struct
++{
++    Uint16 queued;  /* bytes in audsrv's ring just before this submission */
++    Uint16 call_us; /* duration of audsrv_play_audio (saturates) */
++    Uint32 gap_us;  /* time since the previous submission started (0: first) */
++} SDL_PS2AudioSample;
++typedef struct
++{
++    volatile Uint32 submits; /* samples written; sample n is at [n % PS2AUDIO_STAT_SAMPLES] */
++    Uint32 bytes_per_second; /* device format */
++    Uint32 submit_bytes;     /* bytes per submission */
++    Uint32 starved;          /* see above */
++    Uint32 late;
++    Uint32 short_writes;     /* audsrv_play_audio took fewer bytes than given */
++    Uint32 max_query_us;     /* longest audsrv_queued() call */
++    Uint32 dry_us;           /* sum over late submissions of how long the ring was dry, by the clock */
++    SDL_PS2AudioSample s[PS2AUDIO_STAT_SAMPLES];
++} SDL_PS2AudioStats;
++SDL_PS2AudioStats SDL_ps2_audio_stats;
++static SDL_bool ps2audio_stats_on; /* hint SDL_PS2_AUDSRV_STATS, default on; read at open */
++static Uint64 ps2audio_prev_start;
++static Uint32 ps2audio_prev_after; /* bytes queued just after the previous submission */
++
++static Uint64 ps2audio_now_us(void)
++{
++    return GetTimerSystemTime() * 1000ULL / (kBUSCLK / 1000ULL);
++}
++
+ /* The tag name used by PS2 audio */
+ #define PS2AUDIO_DRIVER_NAME "ps2"
+ 
+@@ -99,14 +154,61 @@
+         this->hidden->mixbufs[i] = &this->hidden->rawbuf[i * this->spec.size];
+     }
+ 
++    SDL_ps2_audio_stats.bytes_per_second = (Uint32)this->spec.freq * this->spec.channels * (format.bits / 8);
++    SDL_ps2_audio_stats.submit_bytes = this->spec.size;
++    ps2audio_prev_start = 0;
++    ps2audio_stats_on = SDL_GetHintBoolean("SDL_PS2_AUDSRV_STATS", SDL_TRUE);
++
+     this->hidden->next_buffer = 0;
+     return 0;
+ }
+ 
+ static void PS2AUDIO_PlayDevice(_THIS)
+ {
++    SDL_PS2AudioStats *st = &SDL_ps2_audio_stats;
++    SDL_PS2AudioSample *smp = &st->s[st->submits % PS2AUDIO_STAT_SAMPLES];
+     uint8_t *mixbuf = this->hidden->mixbufs[this->hidden->next_buffer];
+-    audsrv_play_audio((char *)mixbuf, this->spec.size);
++    Uint64 t0, t1, t2;
++    int queued, sent;
++
++    if (!ps2audio_stats_on) {
++        audsrv_play_audio((char *)mixbuf, this->spec.size);
++        this->hidden->next_buffer = (this->hidden->next_buffer + 1) % NUM_BUFFERS;
++        return;
++    }
++    t0 = ps2audio_now_us();
++    queued = audsrv_queued();
++    t1 = ps2audio_now_us();
++    sent = audsrv_play_audio((char *)mixbuf, this->spec.size);
++    t2 = ps2audio_now_us();
++
++    if (queued < 0) {
++        queued = 0;
++    }
++    if ((Uint32)(t1 - t0) > st->max_query_us) {
++        st->max_query_us = (Uint32)(t1 - t0);
++    }
++    if (ps2audio_prev_start != 0) {
++        const Uint32 gap = (Uint32)(t0 - ps2audio_prev_start);
++        if ((Uint32)queued > ps2audio_prev_after || queued == 0) {
++            st->starved++;
++        }
++        if ((Uint64)gap * st->bytes_per_second > (Uint64)ps2audio_prev_after * 1000000) {
++            st->late++;
++            st->dry_us += gap - (Uint32)((Uint64)ps2audio_prev_after * 1000000 / st->bytes_per_second);
++        }
++        smp->gap_us = gap;
++    } else {
++        smp->gap_us = 0;
++    }
++    if (sent < this->spec.size) {
++        st->short_writes++;
++    }
++    smp->queued = (Uint16)queued;
++    smp->call_us = (Uint16)((t2 - t1) > 0xffff ? 0xffff : (t2 - t1));
++    ps2audio_prev_start = t0;
++    ps2audio_prev_after = (Uint32)queued + (sent > 0 ? (Uint32)sent : 0);
++    st->submits++;
+ 
+     this->hidden->next_buffer = (this->hidden->next_buffer + 1) % NUM_BUFFERS;
+ }
