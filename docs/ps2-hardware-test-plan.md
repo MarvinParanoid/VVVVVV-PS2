@@ -142,6 +142,29 @@ sync
   Compare `gs_poc_sw`'s total with `gs_poc_gs`'s build **plus** gs, never with build alone.
 - **"CORRECT"** lines compare the GS output with the software reference: ≥ 99.5% exact and max delta ≤ 2 in PCSX2.
 
+## 4b. Optional: diagnostics overlay build (folder `VVVVVV-P33DIAG`)
+
+**Only after sessions 1 and 2**, and only if they raised questions. The first RC2 baseline does not need it.
+
+**Prepare:**
+
+```sh
+scripts/make-usb-package.sh <data.zip> build/usb-diag --no-build --folder VVVVVV-P33DIAG --label "P3.3-DIAG-DEV - diagnostics overlay, EXPERIMENTAL"
+```
+
+Run this with `out/` built as `P3.3-DIAG-DEV`. Copy `VVVVVV-P33DIAG/` next to the other folders; it has its own saves and logs.
+
+**Use:**
+- Run `mass:/VVVVVV-P33DIAG/VVVVVV.elf`. **L3+R3** cycles: hidden → one-line COMPACT → PERF page → DIAG page → hidden. `optional/overlay.txt` starts in COMPACT.
+- Photograph the PERF and DIAG pages in a normal room, in the Tower, and in Flip Mode. Note whether the text is readable on your TV and whether any of it is cut off at the screen edge.
+- `optional/bench-overlay.txt` (copy to `bench.txt`) runs the hardware benchmark with the PERF page visible, so its results include the overlay's own cost.
+- The DIAG page shows:
+  - which flipped-copy path runs and its counters;
+  - whether log writes to the stick succeed (`LOG ok N fail M`).
+
+  That works even when no file reaches the PC.
+- Metrics and limits: [ps2-hardware-diagnostics.md](ps2-hardware-diagnostics.md).
+
 ## 5. Getting the files back (after each session)
 
 1. Power off the console normally; do not pull the stick while a game runs. The log is written about every 10 s on USB, so the last seconds before a crash may be missing.

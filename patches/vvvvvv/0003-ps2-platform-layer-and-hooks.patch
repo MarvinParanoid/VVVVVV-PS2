@@ -1,6 +1,6 @@
 --- a/desktop_version/src/PS2Platform.h
 +++ b/desktop_version/src/PS2Platform.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,42 @@
 +#ifndef PS2PLATFORM_H
 +#define PS2PLATFORM_H
 +
@@ -34,6 +34,7 @@
 +/* Benchmark support: hold back log file writes while measuring; GS snapshot. */
 +void PS2_LogDefer(int defer);
 +void PS2_LogFlushNow(void); /* synchronous; for the fatal screen */
++void PS2_LogWriteStats(uint32_t *ok, uint32_t *failed); /* log file writes so far */
 +int PS2_OnRealStorage(void); /* not PCSX2/ps2link host: */
 +void PS2_Snapshot(const char *tag);
 +
@@ -44,7 +45,7 @@
 +#endif /* PS2PLATFORM_H */
 --- a/desktop_version/src/PS2Platform.cpp
 +++ b/desktop_version/src/PS2Platform.cpp
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,658 @@
 +#include "PS2Platform.h"
 +
 +#include <SDL.h>
@@ -110,14 +111,28 @@
 +    return GetTimerSystemTime() * 1000ULL / (kBUSCLK / 1000ULL);
 +}
 +
++/* outcome of log writes, shown by the diagnostics overlay (P3.3) */
++static volatile uint32_t log_writes_ok, log_writes_failed;
++
 +static void log_write_file(const char *buf, size_t len)
 +{
 +    int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    bool ok = false;
 +    if (fd >= 0)
 +    {
-+        write(fd, buf, len);
++        ok = write(fd, buf, len) == (ssize_t) len;
 +        close(fd);
 +    }
++    if (ok)
++        log_writes_ok++;
++    else
++        log_writes_failed++;
++}
++
++void PS2_LogWriteStats(uint32_t *ok, uint32_t *failed)
++{
++    *ok = log_writes_ok;
++    *failed = log_writes_failed;
 +}
 +
 +static void log_writer_thread(void *arg)
@@ -388,12 +403,12 @@
 +    PS2Bench_Init();
 +    PS2Diag_Stage("boot device %s, %s storage", cwd, on_real_storage ? "real" : "host");
 +    {
-+        /* overlay.txt: start with the diagnostics overlay on (L3+R3 toggles it) */
++        /* overlay.txt: start with the compact diagnostics line (L3+R3 cycles the modes) */
 +        int fd = open("overlay.txt", O_RDONLY);
 +        if (fd >= 0)
 +        {
 +            close(fd);
-+            PS2Diag_SetOverlay(1);
++            PS2Diag_SetOverlay(PS2DIAG_OVERLAY_COMPACT);
 +        }
 +        /* crashtest.txt: TEST ONLY - a trap exception after ~20 s of frames
 +         * to check that the exception screen appears (a trap rather than an
@@ -691,7 +706,7 @@
 +}
 --- a/desktop_version/src/PS2Bench.h
 +++ b/desktop_version/src/PS2Bench.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,53 @@
 +#ifndef PS2BENCH_H
 +#define PS2BENCH_H
 +
@@ -717,6 +732,14 @@
 +#define PS2_OPT_FLIP_FASTPATH 0x10u /* SDL_SW_FLIP_FASTPATH (SDL patch 0008, P3.1) */
 +#define PS2_OPT_ALL 0xffffffffu
 +extern uint32_t ps2_opts;
++/* SDL patch 0008: how flipped copies were done (counts since boot) */
++extern "C" {
++typedef struct
++{
++    uint32_t fast, fallback, scratch_allocs, scratch_alloc_failures;
++} SDL_SWFlipStats;
++extern SDL_SWFlipStats SDL_sw_flip_stats;
++}
 +/* diagnostics counted by game code */
 +extern uint32_t ps2_tower_full_redraws;
 +
@@ -739,7 +762,7 @@
 +#endif /* PS2BENCH_H */
 --- a/desktop_version/src/PS2Bench.cpp
 +++ b/desktop_version/src/PS2Bench.cpp
-@@ -0,0 +1,987 @@
+@@ -0,0 +1,984 @@
 +#include "PS2Bench.h"
 +
 +#include <SDL.h>
@@ -793,12 +816,6 @@
 +extern SW_RenderStats SW_render_stats;
 +extern int SW_render_stats_kinds;
 +
-+/* patch 0008: how flipped copies were done (P3.2) */
-+typedef struct
-+{
-+    uint32_t fast, fallback, scratch_allocs, scratch_alloc_failures;
-+} SDL_SWFlipStats;
-+extern SDL_SWFlipStats SDL_sw_flip_stats;
 +}
 +
 +/* SDL_RenderCommandType values (SDL_sysrender.h) */
@@ -1064,7 +1081,10 @@
 +    enabled = frames != NULL;
 +    if (cfg_overlay)
 +    {
-+        PS2Diag_SetOverlay(1);
++        /* overlay=1 performance page (as before), 2 diagnostics, 3 compact line */
++        PS2Diag_SetOverlay(cfg_overlay == 2   ? PS2DIAG_OVERLAY_DIAG
++                           : cfg_overlay == 3 ? PS2DIAG_OVERLAY_COMPACT
++                                              : PS2DIAG_OVERLAY_PERF);
 +    }
 +    result_line("# VVVVVV PS2 benchmark, build %s: settle=%d s measure=%d s over30=%d opts=0x%lx overlay=%d flip=%d\n"
 +                "# times in ms; tps = logic ticks per second (full speed %.1f); tps_min = slowest 1 s window\n"
@@ -1653,7 +1673,7 @@
 +                }
 +                SDL_snprintf(status, sizeof(status), fd >= 0 ? "BENCH DONE: see %s" : "BENCH DONE (%s not written)", rpath);
 +                PS2Diag_SetStatus(status);
-+                PS2Diag_SetOverlay(1);
++                PS2Diag_SetOverlay(PS2DIAG_OVERLAY_PERF);
 +            }
 +            enter(P_DONE);
 +            break;
@@ -1729,7 +1749,7 @@
 +}
 --- a/desktop_version/src/PS2Diag.h
 +++ b/desktop_version/src/PS2Diag.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,51 @@
 +#ifndef PS2DIAG_H
 +#define PS2DIAG_H
 +
@@ -1763,9 +1783,13 @@
 +void PS2Diag_Tick(void);                               /* one logic tick */
 +void PS2Diag_Frame(uint32_t period_us, uint32_t render_us); /* once per loop */
 +void PS2Diag_DrawOverlay(void);                        /* after render(), window is the target */
-+void PS2Diag_SetOverlay(int on);
++#define PS2DIAG_OVERLAY_OFF 0
++#define PS2DIAG_OVERLAY_COMPACT 1 /* one line */
++#define PS2DIAG_OVERLAY_PERF 2
++#define PS2DIAG_OVERLAY_DIAG 3
++void PS2Diag_SetOverlay(int mode); /* PS2DIAG_OVERLAY_* (L3+R3 cycles them in this order) */
 +void PS2Diag_SetStatus(const char *text); /* shown on the overlay's last line when there is no error */
-+int PS2Diag_OverlayOn(void);
++int PS2Diag_OverlayOn(void);           /* the current mode, 0 when hidden */
 +
 +/* set once a fatal/exception screen owns the display; the main loop then stops */
 +int PS2Diag_Halted(void);
@@ -1779,7 +1803,7 @@
 +#endif /* PS2DIAG_H */
 --- a/desktop_version/src/PS2Diag.cpp
 +++ b/desktop_version/src/PS2Diag.cpp
-@@ -0,0 +1,571 @@
+@@ -0,0 +1,765 @@
 +#include "PS2Diag.h"
 +
 +#include <SDL.h>
@@ -1800,6 +1824,7 @@
 +#include "Game.h"
 +#include "Graphics.h"
 +#include "Music.h"
++#include "PS2Bench.h"
 +#include "PS2Platform.h"
 +#include "Screen.h"
 +
@@ -2173,37 +2198,63 @@
 +    }
 +}
 +
-+/* ---- overlay ---- */
-+static int overlay_on;
++/* ---- overlay ----
++ * L3+R3 cycles OFF -> COMPACT -> PERF -> DIAG -> OFF. Counters go into 0.5 s
++ * buckets; the text is rebuilt twice a second: current values cover the last
++ * 1 s (2 buckets), AVG/MIN/MAX the last 10 s (20 buckets). The panel is drawn
++ * into one texture only when the text changes; every frame copies it,
++ * unblended, onto the finished window (it covers the game's UI there). */
++enum { OVL_OFF = PS2DIAG_OVERLAY_OFF, OVL_COMPACT = PS2DIAG_OVERLAY_COMPACT, OVL_PERF = PS2DIAG_OVERLAY_PERF,
++       OVL_DIAG = PS2DIAG_OVERLAY_DIAG, OVL_MODES };
++#define PANEL_X 16 /* inside the CRT overscan on 320x240 */
++#define PANEL_Y 16
++#define PANEL_W 288
++#define PANEL_H 88
++#define ROWS 6
++#define VALUE_X 88 /* label column: 10 characters */
++#define BUCKET_US 500000
++#define BUCKETS 20
++
++typedef struct
++{
++    uint32_t us, ticks, loops, renders, max_period;
++    uint64_t period, render, decode;
++} Bucket;
++
++static int overlay_mode;
 +static bool overlay_dirty;
 +static SDL_Texture *overlay_tex;
-+static char lines[3][48];
-+static uint8_t line_rgb[3][3];
-+static uint32_t win_ticks, win_loops, win_renders;
-+static uint64_t win_period, win_render, win_t0;
++static int compact_w;
++static char header[40], footer[40], compact[40];
++static char row_label[ROWS][12], row_value[ROWS][28];
++static uint8_t value_rgb[ROWS][3], footer_rgb[3];
++static Bucket cur, hist[BUCKETS];
++static int hist_n, hist_i;
++static uint64_t bucket_t0;
 +#ifdef VVV_MUSIC_STREAMING
-+static uint64_t win_decode0;
++static uint64_t decode0;
 +#endif
 +static char status_text[48];
 +static SDL_GameController *pad;
 +static bool combo_was_down;
 +
-+#define OVERLAY_Y 16 /* below the top overscan of a CRT */
-+#define OVERLAY_H 32
-+
 +void PS2Diag_Tick(void)
 +{
-+    win_ticks++;
++    cur.ticks++;
 +}
 +
 +void PS2Diag_Frame(uint32_t period_us, uint32_t render_us)
 +{
-+    win_loops++;
-+    win_period += period_us;
++    cur.loops++;
++    cur.period += period_us;
++    if (period_us > cur.max_period)
++    {
++        cur.max_period = period_us;
++    }
 +    if (render_us)
 +    {
-+        win_renders++;
-+        win_render += render_us;
++        cur.renders++;
++        cur.render += render_us;
 +    }
 +}
 +
@@ -2212,62 +2263,194 @@
 +    SDL_strlcpy(status_text, text, sizeof(status_text));
 +}
 +
-+void PS2Diag_SetOverlay(int on)
++void PS2Diag_SetOverlay(int mode)
 +{
-+    overlay_on = on;
-+    win_t0 = 0;
++    overlay_mode = mode < 0 || mode >= OVL_MODES ? OVL_OFF : mode;
++    bucket_t0 = 0;
++    hist_n = hist_i = 0;
 +}
 +
 +int PS2Diag_OverlayOn(void)
 +{
-+    return overlay_on;
++    return overlay_mode;
 +}
 +
-+static void set_line(int i, uint8_t r, uint8_t g, uint8_t b, const char *fmt, ...)
++static void set_row(int i, const char *label, uint8_t r, uint8_t g, uint8_t b, const char *fmt, ...)
 +{
 +    va_list ap;
 +    va_start(ap, fmt);
-+    SDL_vsnprintf(lines[i], sizeof(lines[i]), fmt, ap);
++    SDL_vsnprintf(row_value[i], sizeof(row_value[i]), fmt, ap);
 +    va_end(ap);
-+    line_rgb[i][0] = r;
-+    line_rgb[i][1] = g;
-+    line_rgb[i][2] = b;
++    SDL_strlcpy(row_label[i], label, sizeof(row_label[i]));
++    value_rgb[i][0] = r;
++    value_rgb[i][1] = g;
++    value_rgb[i][2] = b;
 +}
 +
-+/* once a second: turn the window's counters into three short text lines */
++/* counts in at most 6 characters: 123456, 1234k, 1234M */
++static const char *count(char *buf, uint32_t v)
++{
++    if (v < 1000000u)
++        SDL_snprintf(buf, 8, "%lu", (unsigned long) v);
++    else if (v < 10000000u)
++        SDL_snprintf(buf, 8, "%luk", (unsigned long) (v / 1000u));
++    else
++        SDL_snprintf(buf, 8, "%luM", (unsigned long) (v / 1000000u));
++    return buf;
++}
++
++static const char *renderer_name(void)
++{
++    static char name[12];
++    SDL_RendererInfo info;
++    if (name[0] == '\0' && gameScreen.m_renderer != NULL && SDL_GetRendererInfo(gameScreen.m_renderer, &info) == 0)
++    {
++        SDL_strlcpy(name, info.name, sizeof(name));
++    }
++    return name[0] ? name : "N/A";
++}
++
++/* EndOfHeap() - sbrk(0) (never handed to malloc yet) plus the free bytes
++ * inside malloc's arena (maybe fragmented): what malloc could still return,
++ * at best. Not free system RAM, not the largest allocatable block. */
++static double heap_free_mib(void)
++{
++    struct mallinfo mi = mallinfo();
++    return ((char *) EndOfHeap() - (char *) sbrk(0) + (double) mi.fordblks) / 1048576.0;
++}
++
++/* every 0.5 s: close the bucket, then rebuild the text of the current mode */
 +static void update_text(uint64_t now)
 +{
-+    const double secs = (now - win_t0) / 1e6;
-+    const double tps = win_ticks / secs, target = 1000.0 / game.get_timestep();
-+    const double frame = win_loops ? win_period / (double) win_loops / 1000.0 : 0.0;
-+    const double render = win_renders ? win_render / (double) win_renders / 1000.0 : 0.0;
-+    struct mallinfo mi = mallinfo();
-+    const double free_mb = ((char *) EndOfHeap() - (char *) sbrk(0) + (double) mi.fordblks) / 1048576.0;
-+    const bool slow = tps < target - 0.5;
-+
-+    set_line(0, 255, slow ? 128 : 255, slow ? 128 : 255, "TPS %4.1f/%4.1f FRAME %4.1fms RND %4.1fms",
-+             tps, target, frame, render);
++    char a[8], b[8];
++    cur.us = (uint32_t) (now - bucket_t0);
 +#ifdef VVV_MUSIC_STREAMING
 +    StreamStats ms;
 +    MUSIC_GetStreamStats(&ms);
-+    const double decode = (ms.decode_us_total - win_decode0) / secs / 1000.0;
-+    win_decode0 = ms.decode_us_total;
-+    set_line(1, 255, ms.underruns ? 128 : 255, ms.underruns ? 128 : 255, "MUSIC %s %3.0fms/s UNDERRUN %lu FREE %3.1fM",
-+             ms.active ? "on " : "off", decode, (unsigned long) ms.underruns, free_mb);
-+#else
-+    set_line(1, 255, 255, 255, "MUSIC off (build)  FREE %3.1fM", free_mb);
++    cur.decode = ms.decode_us_total - decode0;
++    decode0 = ms.decode_us_total;
 +#endif
-+    if (last_error[0])
++    hist[hist_i] = cur;
++    hist_i = (hist_i + 1) % BUCKETS;
++    if (hist_n < BUCKETS)
 +    {
-+        set_line(2, 255, 200, 64, "ERR %.34s", last_error);
++        hist_n++;
++    }
++    SDL_zero(cur);
++    bucket_t0 = now;
++
++    /* last 1 s = the two newest buckets; 10 s = all of them */
++    const Bucket &n0 = hist[(hist_i + BUCKETS - 1) % BUCKETS];
++    const Bucket &n1 = hist[(hist_i + BUCKETS - 2) % BUCKETS];
++    const bool have1 = hist_n >= 2, have10 = hist_n >= 4;
++    const double target = 1000.0 / game.get_timestep();
++    double tps = 0, avg = 0, mn = 1e9, frame = 0, render = 0;
++#ifdef VVV_MUSIC_STREAMING
++    double decode = 0;
++#endif
++    uint64_t ticks = 0, us = 0;
++    uint32_t mx = 0;
++    if (have1)
++    {
++        tps = (n0.ticks + n1.ticks) * 1e6 / (double) (n0.us + n1.us);
++        frame = n0.loops + n1.loops ? (n0.period + n1.period) / (double) (n0.loops + n1.loops) / 1000.0 : 0.0;
++        render = n0.renders + n1.renders ? (n0.render + n1.render) / (double) (n0.renders + n1.renders) / 1000.0 : 0.0;
++#ifdef VVV_MUSIC_STREAMING
++        decode = (n0.decode + n1.decode) * 1000.0 / (double) (n0.us + n1.us);
++#endif
++    }
++    for (int i = 0; i < hist_n; i++)
++    {
++        const Bucket &h = hist[i], &p = hist[(i + BUCKETS - 1) % BUCKETS];
++        ticks += h.ticks;
++        us += h.us;
++        mx = h.max_period > mx ? h.max_period : mx;
++        /* MIN over every 1 s window (adjacent buckets) inside the 10 s */
++        if (i != hist_i && (hist_n == BUCKETS || i > 0))
++        {
++            const double w = (h.ticks + p.ticks) * 1e6 / (double) (h.us + p.us);
++            mn = w < mn ? w : mn;
++        }
++    }
++    avg = us ? ticks * 1e6 / (double) us : 0.0;
++    const bool slow = have10 && mn < target - 0.5;
++    const double heap = heap_free_mib();
++
++    if (overlay_mode == OVL_COMPACT)
++    {
++#ifdef VVV_MUSIC_STREAMING
++        if (have1)
++            SDL_snprintf(compact, sizeof(compact), "TPS %4.1f XRUN %lu HEAP %.1fM", tps, (unsigned long) ms.underruns, heap);
++        else
++            SDL_snprintf(compact, sizeof(compact), "TPS --.- XRUN %lu HEAP %.1fM", (unsigned long) ms.underruns, heap);
++#else
++        if (have1)
++            SDL_snprintf(compact, sizeof(compact), "TPS %4.1f HEAP %.1fM", tps, heap);
++        else
++            SDL_snprintf(compact, sizeof(compact), "TPS --.- HEAP %.1fM", heap);
++#endif
++    }
++    else if (overlay_mode == OVL_PERF)
++    {
++        SDL_snprintf(header, sizeof(header), "%.18s", VVV_PS2_BUILD_ID);
++        if (have1)
++            set_row(0, "TPS", 255, tps < target - 0.5 ? 128 : 255, tps < target - 0.5 ? 128 : 255, "%4.1f / %4.1f target", tps, target);
++        else
++            set_row(0, "TPS", 160, 160, 160, "N/A (first 1 s)");
++        if (have10)
++            set_row(1, "TPS 10s", 255, slow ? 128 : 255, slow ? 128 : 255, "avg %4.1f  min %4.1f", avg, mn);
++        else
++            set_row(1, "TPS 10s", 160, 160, 160, "N/A (first 2 s)");
++        if (have1)
++            set_row(2, "FRAME", 255, 255, 255, "%4.1f ms  max %4.1f", frame, mx / 1000.0);
++        else
++            set_row(2, "FRAME", 160, 160, 160, "N/A");
++        if (have1 && render > 0)
++            set_row(3, "RENDER", 255, 255, 255, "%4.1f ms", render);
++        else
++            set_row(3, "RENDER", 160, 160, 160, "N/A");
++#ifdef VVV_MUSIC_STREAMING
++        set_row(4, "MUSIC", 255, ms.underruns ? 128 : 255, ms.underruns ? 128 : 255, "%s  %3.0f ms/s  XRUN %lu",
++                ms.active ? "on " : "off", decode, (unsigned long) ms.underruns);
++#else
++        set_row(4, "MUSIC", 160, 160, 160, "off (no-music build)");
++#endif
++        set_row(5, "HEAP FREE", 255, 255, 255, "%.1f MiB", heap);
 +    }
 +    else
 +    {
-+        set_line(2, 128, 255, 128, "%s", status_text[0] ? status_text : "STATUS OK  " VVV_PS2_BUILD_ID "  L3+R3 hides");
++        uint32_t ok, failed;
++        PS2_LogWriteStats(&ok, &failed);
++        const SDL_SWFlipStats &fs = SDL_sw_flip_stats;
++        SDL_snprintf(header, sizeof(header), "%.18s", VVV_PS2_BUILD_ID);
++        set_row(0, "RENDERER", 255, 255, 255, "SDL %.8s", renderer_name());
++        set_row(1, "FLIP MODE", 255, 255, 255, "%-3s  FASTPATH %s", graphics.flipmode ? "on" : "off",
++                (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "on" : "off");
++        set_row(2, "FLIPPED", 255, 255, 255, "fast %s  old %s", count(a, fs.fast), count(b, fs.fallback));
++        set_row(3, "SCRATCH", 255, 255, 255, "%lu allocs  %lu failed", (unsigned long) fs.scratch_allocs,
++                (unsigned long) fs.scratch_alloc_failures);
++        set_row(4, "STORAGE", failed ? 255 : 255, failed ? 200 : 255, failed ? 64 : 255, "%s  log ok %lu fail %lu",
++                PS2_OnRealStorage() ? "USB" : "host", (unsigned long) ok, (unsigned long) failed);
++        if (last_error[0])
++            set_row(5, "LAST ERR", 255, 200, 64, "%.24s", last_error);
++        else
++            set_row(5, "LAST ERR", 128, 255, 128, "none");
 +    }
-+    win_ticks = win_loops = win_renders = 0;
-+    win_period = win_render = 0;
-+    win_t0 = now;
++    if (status_text[0])
++    {
++        SDL_snprintf(footer, sizeof(footer), "%.34s", status_text);
++        footer_rgb[0] = 128, footer_rgb[1] = 255, footer_rgb[2] = 128;
++    }
++    else if (overlay_mode == OVL_PERF && last_error[0])
++    {
++        SDL_strlcpy(footer, "ERROR: see the DIAG page (L3+R3)", sizeof(footer));
++        footer_rgb[0] = 255, footer_rgb[1] = 200, footer_rgb[2] = 64;
++    }
++    else
++    {
++        SDL_strlcpy(footer, overlay_mode == OVL_PERF ? "L3+R3: next page (DIAG)" : "L3+R3: hide", sizeof(footer));
++        footer_rgb[0] = footer_rgb[1] = footer_rgb[2] = 140;
++    }
 +    overlay_dirty = true;
 +}
 +
@@ -2289,36 +2472,67 @@
 +    {
 +        return;
 +    }
-+    /* both stick clicks: VVVVVV binds neither by default */
++    /* both stick clicks, on the press only: VVVVVV binds neither by default */
 +    const bool down = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK) &&
 +                      SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK);
 +    if (down && !combo_was_down)
 +    {
-+        PS2Diag_SetOverlay(!overlay_on);
-+        PS2_Log("OVERLAY %s (L3+R3)", overlay_on ? "on" : "off");
++        static const char *const names[OVL_MODES] = {"off", "compact", "performance", "diagnostics"};
++        PS2Diag_SetOverlay((overlay_mode + 1) % OVL_MODES);
++        PS2_Log("OVERLAY %s (L3+R3)", names[overlay_mode]);
 +    }
 +    combo_was_down = down;
++}
++
++static void draw_panel(void)
++{
++    /* font::print mirrors glyphs in Flip Mode; the overlay stays upright */
++    const bool flipmode = graphics.flipmode;
++    graphics.flipmode = false;
++    graphics.clear(0, 0, 0, 255);
++    if (overlay_mode == OVL_COMPACT)
++    {
++        font::print(0, 4, 2, compact, 255, 255, 255);
++        compact_w = 8 + 8 * (int) SDL_strlen(compact);
++    }
++    else
++    {
++        font::print(0, 8, 3, header, 164, 196, 255);
++        font::print(0, PANEL_W - 8 - 4 * 8, 3, overlay_mode == OVL_PERF ? "PERF" : "DIAG", 164, 196, 255);
++        graphics.fill_rect(8, 13, PANEL_W - 16, 1, 90, 90, 110);
++        for (int i = 0; i < ROWS; i++)
++        {
++            font::print(0, 8, 17 + i * 10, row_label[i], 150, 150, 150);
++            font::print(0, VALUE_X, 17 + i * 10, row_value[i], value_rgb[i][0], value_rgb[i][1], value_rgb[i][2]);
++        }
++        graphics.fill_rect(8, 77, PANEL_W - 16, 1, 90, 90, 110);
++        font::print(0, 8, 79, footer, footer_rgb[0], footer_rgb[1], footer_rgb[2]);
++    }
++    graphics.flipmode = flipmode;
 +}
 +
 +void PS2Diag_DrawOverlay(void)
 +{
 +    SDL_Renderer *rend = gameScreen.m_renderer;
 +    poll_combo();
-+    if (!overlay_on || rend == NULL)
++    if (overlay_mode == OVL_OFF || rend == NULL)
 +    {
 +        return;
 +    }
 +    const uint64_t now = PS2_NowUs();
-+    if (win_t0 == 0)
++    if (bucket_t0 == 0)
 +    {
-+        win_t0 = now;
-+        win_ticks = win_loops = win_renders = 0;
-+        win_period = win_render = 0;
-+        set_line(0, 255, 255, 255, "diagnostics: first values in 1 s");
-+        lines[1][0] = lines[2][0] = '\0';
-+        overlay_dirty = true;
++        bucket_t0 = now;
++        SDL_zero(cur);
++#ifdef VVV_MUSIC_STREAMING
++        StreamStats ms;
++        MUSIC_GetStreamStats(&ms);
++        decode0 = ms.decode_us_total;
++#endif
++        update_text(now); /* empty first bucket: every value reads N/A */
++        hist_n = hist_i = 0;
 +    }
-+    else if (now - win_t0 >= 1000000)
++    else if (now - bucket_t0 >= BUCKET_US)
 +    {
 +        update_text(now);
 +    }
@@ -2326,29 +2540,33 @@
 +    SDL_Texture *target = SDL_GetRenderTarget(rend);
 +    if (overlay_tex == NULL)
 +    {
-+        overlay_tex = SDL_CreateTexture(rend, VVV_TARGET_PIXELFORMAT, SDL_TEXTUREACCESS_TARGET, 320, OVERLAY_H);
++        overlay_tex = SDL_CreateTexture(rend, VVV_TARGET_PIXELFORMAT, SDL_TEXTUREACCESS_TARGET, PANEL_W, PANEL_H);
 +        if (overlay_tex == NULL)
 +        {
-+            overlay_on = 0;
++            overlay_mode = OVL_OFF;
 +            return;
 +        }
 +        SDL_SetTextureBlendMode(overlay_tex, SDL_BLENDMODE_NONE);
 +    }
 +    if (overlay_dirty)
 +    {
-+        /* text is drawn only when it changes: about 3 x 40 glyphs a second */
 +        graphics.set_render_target(overlay_tex);
-+        graphics.clear(0, 0, 0, 255);
-+        for (int i = 0; i < 3; i++)
-+        {
-+            font::print(0, 4, 1 + i * 10, lines[i], line_rgb[i][0], line_rgb[i][1], line_rgb[i][2]);
-+        }
++        draw_panel();
 +        overlay_dirty = false;
 +    }
-+    /* per frame: one unblended 320x32 copy onto the finished window */
++    /* per frame: one unblended copy onto the finished window */
 +    graphics.set_render_target(NULL);
-+    const SDL_Rect dst = {0, OVERLAY_Y, 320, OVERLAY_H};
-+    SDL_RenderCopy(rend, overlay_tex, NULL, &dst);
++    if (overlay_mode == OVL_COMPACT)
++    {
++        /* top right: the game's HUD uses the left side (time trials, Gravitron) */
++        const SDL_Rect src = {0, 0, compact_w, 12}, dst = {312 - compact_w, 14, compact_w, 12};
++        SDL_RenderCopy(rend, overlay_tex, &src, &dst);
++    }
++    else
++    {
++        const SDL_Rect dst = {PANEL_X, PANEL_Y, PANEL_W, PANEL_H};
++        SDL_RenderCopy(rend, overlay_tex, NULL, &dst);
++    }
 +    graphics.set_render_target(target);
 +}
 --- a/desktop_version/src/main.cpp
