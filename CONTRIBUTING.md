@@ -31,7 +31,7 @@ The checklist in [docs/ps2-hardware-first-boot.md](docs/ps2-hardware-first-boot.
 | SDL 2.32.10 | `scripts/build-sdl2-ps2.sh` | `patches/sdl2/*.patch` |
 
 **Workflow:**
-1. Build once (see the README). This creates the patched trees `build/vvvvvv-src/` and `build/sdl2-ps2-opt/src/`.
+1. Build once (see [docs/building.md](docs/building.md)). This creates the patched trees `build/vvvvvv-src/` and `build/sdl2-ps2-opt/src/`.
 2. Edit those trees and rebuild with `scripts/build-vvvvvv-ps2.sh` (no `--refetch`, which would discard your edits). For SDL, rebuild the library with the commands inside `scripts/build-sdl2-ps2.sh`, without its re-extract step.
 3. Turn your edits back into patches:
    - VVVVVV: `scripts/regen-vvvvvv-patches.sh`

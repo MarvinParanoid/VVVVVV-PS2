@@ -28,7 +28,7 @@ The patches contain no game assets.
 
 **VVVVVV is a commercial game.** The graphics, sounds and music (`data.zip`)
 are proprietary and are **not** included here. You must supply your own
-`data.zip`; see the [README](README.md#game-data).
+`data.zip`; see [docs/installing.md](docs/installing.md#game-data).
 
 ## Third-party components used by the build (not included here)
 

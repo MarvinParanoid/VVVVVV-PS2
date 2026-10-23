@@ -18,7 +18,7 @@ phase reports in this folder, which hold the full data and methods.
 **What existed.** SDL 2.32.10 has a PS2 port (gsKit renderer, audsrv audio, libpad input). VVVVVV's SDL2 branch (`2.4-updates`) builds against SDL2, PhysicsFS and FAudio. VVVVVV draws everything through render targets, which the gsKit renderer does not implement, so the game uses SDL's software renderer.
 
 **Approach.** Everything is kept as patches on pinned upstream sources:
-- 7 for SDL;
+- 8 for SDL;
 - 5 for VVVVVV.
 
 All changes are guarded by `__PS2__` or CMake `if(PS2)`, and game logic is not changed.
@@ -125,7 +125,7 @@ The diagnostics are built for a first test on a console with no debugger attache
 | **Boot console** | A text screen lists each start-up step (IOP reset, USB drivers, boot device, assets, SDL, renderer) before any graphics exist. A hang shows the last step reached |
 | **Fatal-error screen** | Any fatal exit shows the last stage, the last error and a hint, e.g. "is the USB stick write-protected?" |
 | **CPU exception screen** | An EE exception handler saves the register frame and redirects to a report function. That function draws the registers and the build ID, and logs them. `scripts/ps2-profile.py --addr` turns the addresses into function names using the unstripped ELF |
-| **Overlay** (L3+R3) | Ticks/s, frame and render time, music state, underruns and free memory, updated once a second |
+| **Overlay** (L3+R3) | Ticks/s, frame and render time, music state, underruns and free heap, updated once a second. The newer P3.3 overlay adds a compact mode and a diagnostics page ([details](ps2-hardware-diagnostics.md)) |
 | **Hardware benchmark** | Put `bench.txt` next to the ELF to play six fixed scenes hands-off. It writes `bench_results.txt` and golden-frame CRCs, so console numbers compare directly with PCSX2 |
 | **`fs_smoke.elf`** | A standalone USB storage self-test: device readiness, read speed, random-seek latency, CRC32s of the packaged files, and directory, write and delete checks |
 | **Log** | A background writer thread flushes every 10 s on real storage, so logging never blocks the render or audio threads |
