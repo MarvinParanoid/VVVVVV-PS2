@@ -1,61 +1,63 @@
 name: Hardware test report
-description: Results from running the port on a real PlayStation 2 (success or failure, both help).
-title: "[HW] <console model>: <short result>"
+description: Results from a real PlayStation 2 - success or failure, both help.
+title: "[HW] <console model>: <works / problem in short>"
 labels: ["hardware-test"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thank you for testing on real hardware! The checklist in `docs/ps2-hardware-first-boot.md` walks through a full session.
-        **Do not attach `data.zip`, `data-ps2.zip` or any extracted game graphics, sounds or music.**
-  - type: input
-    id: build
-    attributes:
-      label: Build ID
-      description: Shown in the first line of the white start-up list (e.g. `H1-RC2`, or `dev` for a self-built ELF).
-    validations:
-      required: true
+        Thank you for testing on a real console! The steps are in `TESTING.txt` of the tester release.
+        Partial results are welcome: if it stopped at step 1, report step 1.
+        **Never attach `data.zip`, `data-ps2.zip`, whole game folders or extracted game graphics, sounds or music.**
   - type: input
     id: console
     attributes:
       label: Console model and region
-      description: From the sticker on the bottom, e.g. SCPH-75004 (PAL).
+      description: From the sticker on the bottom, e.g. SCPH-75004 (PAL), SCPH-90001 (NTSC-U).
     validations:
       required: true
   - type: input
     id: launcher
     attributes:
-      label: How it was launched
-      description: e.g. FMCB 1.966 → wLaunchELF 4.43x, from mass:/VVVVVV/
+      label: Homebrew launcher
+      description: e.g. FMCB 1.966 + wLaunchELF 4.43x; PS2BBL; OPL...
     validations:
       required: true
   - type: input
     id: usb
     attributes:
       label: USB stick
-      description: Brand, model, size, file system (FAT32/exFAT), and which port.
+      description: Brand, model, size, FAT32/MBR, which USB port.
   - type: input
     id: display
     attributes:
-      label: TV and cable
-      description: e.g. CRT via RGB SCART, LCD via component, composite.
+      label: TV and cable / video
+      description: e.g. CRT via RGB SCART, LCD via component, HDMI adapter. The game outputs NTSC 60 Hz.
+  - type: input
+    id: release
+    attributes:
+      label: Release and build IDs
+      description: Release archive name (e.g. VVVVVV-PS2-H2-TEST1) and the build ID shown on the start-up list (H1-RC2 / the experimental one).
+    validations:
+      required: true
   - type: dropdown
     id: fs_smoke
     attributes:
-      label: fs_smoke.elf result
+      label: fs_smoke.elf (USB self-test)
       options:
         - ALL OK
-        - PROBLEMS (see attached photo/log)
+        - PROBLEMS (photo/log attached)
         - Did not start / black screen
         - Not run
     validations:
       required: true
   - type: dropdown
-    id: game
+    id: session1
     attributes:
-      label: How far did VVVVVV.elf get?
+      label: Session 1 - H1-RC2 (folder VVVVVV)
       options:
-        - Played normally
+        - Played normally, benchmark done
+        - Played normally, benchmark not run or not finished
         - Title screen, but problems in game
         - Stopped on the start-up list
         - FATAL ERROR screen
@@ -64,19 +66,40 @@ body:
         - Not run
     validations:
       required: true
+  - type: dropdown
+    id: session2
+    attributes:
+      label: Session 2 - experimental build (folder VVVVVV-P31DEV)
+      options:
+        - All three benchmarks done
+        - Played, some benchmarks done
+        - Problems (describe below)
+        - Not run
+    validations:
+      required: true
+  - type: dropdown
+    id: session3
+    attributes:
+      label: Session 3 - GSPOC (optional)
+      options:
+        - Not run
+        - Both programs ran (logs attached)
+        - Problems (describe below)
   - type: textarea
     id: observations
     attributes:
       label: What you saw and heard
       description: |
-        Music and sound (gaps, clicks?), smoothness, overlay values (L3+R3: TPS, FRAME, RND, UNDERRUN, FREE),
-        save/continue, picture edges/colours. For a failure: the last line of the start-up list and what you did just before.
+        Controls, graphics, music and sound (clicks? gaps?), overlay values (L3+R3: TPS, FRAME, FREE),
+        save/continue, Flip Mode, time from launch to title. For a failure: the last line of the
+        start-up list, what you did just before, how long you waited.
     validations:
       required: true
   - type: textarea
     id: files
     attributes:
-      label: Logs and photos
+      label: Logs, results and photos
       description: |
-        Drag files here from the game folder on the stick: `fs_smoke.log`, `vvvvvv_ps2.log`, `bench_results.txt` (if you ran the benchmark).
+        Drag files here: fs_smoke.log, vvvvvv_ps2*.log, bench_results*.txt (and GSPOC logs).
         Photos of the fs_smoke screen and of any FATAL ERROR / CPU EXCEPTION screen (whole screen, readable).
+        If no files were written on the stick, say so - photos and notes are enough.

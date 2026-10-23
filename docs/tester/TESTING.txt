@@ -1,0 +1,100 @@
+VVVVVV-PS2 hardware test - what to do and what to send back
+===============================================================
+
+Nothing here has been confirmed on a real PS2. Any outcome is useful.
+Do the sessions in order; stop wherever something fails and report that.
+
+Before you start, write down:
+  - console model (sticker on the bottom, e.g. SCPH-75004) and region
+  - how you launch homebrew (FMCB/PS2BBL version, wLaunchELF version)
+  - USB stick brand, model and size; which USB port
+  - TV and cable (RGB SCART / component / composite / HDMI adapter)
+
+Every screen and log names its build. Package VVVVVV = "H1-RC2",
+package VVVVVV-P31DEV = the experimental build (see BUILD-INFO.txt).
+
+
+SESSION 1 - baseline (about 15 minutes). Flip Mode stays OFF.
+---------------------------------------------------------------
+1. wLaunchELF > FileBrowser > mass:/ : the folders VVVVVV, VVVVVV-P31DEV
+   (and GSPOC) must be listed. If mass:/ is empty, see "Problems" below.
+2. Run mass:/VVVVVV/fs_smoke.elf (USB self-test, ~20 s). It must end with
+   "ALL OK". Take a photo of the screen. Reset the console.
+3. Run mass:/VVVVVV/VVVVVV.elf. A white start-up list appears; its first
+   line must end in "H1-RC2". Note how many seconds until the title screen.
+4. Title screen: press Cross. Menu music should start. Press L3+R3: a small
+   overlay appears; note the numbers (TPS, FRAME, FREE). L3+R3 again hides it.
+5. play > new game. Skip the dialogue with Cross. Walk through a few rooms:
+   controls OK? graphics OK? music and sound effects OK, no clicks or gaps?
+   With the overlay on in a normal room, TPS 29.4 is full speed.
+6. Save: press Triangle (map), Right three times (SAVE tab), Cross.
+   Reset, start VVVVVV.elf again, play > continue: are you back in the room?
+7. Benchmark (about 4 minutes, hands off):
+   on your PC, copy VVVVVV/optional/bench.txt to VVVVVV/bench.txt (or in
+   wLaunchELF: highlight the file, R1 > Copy, go to VVVVVV/, R1 > Paste).
+   Run VVVVVV.elf and touch nothing until the overlay says "BENCH DONE".
+   Reset, then delete VVVVVV/bench.txt (otherwise every launch benchmarks).
+
+If session 1 worked, please already report it (see "What to send back").
+
+
+SESSION 2 - experimental build (about 20 minutes)
+---------------------------------------------------
+Uses folder VVVVVV-P31DEV only; its saves and logs are separate.
+1. Run mass:/VVVVVV-P31DEV/fs_smoke.elf: "ALL OK"? Reset.
+2. Run mass:/VVVVVV-P31DEV/VVVVVV.elf. The start-up list must end with the
+   experimental build name (not H1-RC2). Play a few rooms as in session 1.
+3. Three benchmarks, one after another. Each time copy one file from
+   VVVVVV-P31DEV/optional/ to VVVVVV-P31DEV/bench.txt (replacing the old
+   one), run VVVVVV.elf, wait for "BENCH DONE" (~4 min), reset:
+     a) bench-normal.txt    normal mode
+     b) bench-flip.txt      Flip Mode (upside-down game), new fast code
+     c) bench-flipoff.txt   Flip Mode with the new code switched off
+   They write bench_results_normal.txt, bench_results_flip.txt and
+   bench_results_flipoff.txt, so nothing is overwritten. Delete bench.txt
+   afterwards.
+4. Flip Mode by hand: on the title screen, options > accessibility >
+   unlock play modes > unlock flip mode (only this folder's save is
+   affected). Then play > play modes > flip mode, and play a little:
+   does everything look right upside down, is text readable? Note the TPS.
+   If you can reach them (unlock secret lab in the same menu): the Super
+   Gravitron in Flip Mode; the Tower and the Panic Room.
+5. Save and continue once in this build.
+
+
+SESSION 3 - optional technical experiments (GSPOC)
+----------------------------------------------------
+Only if you like experimental software. Not part of the game.
+1. Run mass:/GSPOC/gs_poc_sw.elf, wait 1-2 minutes (no "done" screen), reset.
+2. Run mass:/GSPOC/gs_poc_gs.elf, wait ~30 s, reset.
+3. Send gs_poc_sw.log, gs_poc_gs.log (and gs_poc_gs_*.ppm) from GSPOC/.
+
+
+What to send back
+-----------------
+Open a "Hardware test report" issue:
+  https://github.com/MarvinParanoid/VVVVVV-PS2/issues/new/choose
+Attach from the stick (copy them on a PC after the session):
+  VVVVVV/:          fs_smoke.log, vvvvvv_ps2.log, bench_results.txt
+  VVVVVV-P31DEV/:   fs_smoke.log, vvvvvv_ps2*.log, bench_results_*.txt
+Plus photos: fs_smoke result, any FATAL ERROR / CPU EXCEPTION screen (the
+whole screen, readable), the overlay in a room.
+Never attach data.zip, data-ps2.zip or whole game folders.
+
+If the console could not write files (no logs on the stick afterwards):
+photos and written notes are enough - note the build ID shown on screen,
+the last line of the start-up list, what you did, and how long you waited.
+
+
+Problems
+--------
+mass:/ empty                 stick must be FAT32 + MBR; plug it in before
+                             power-on, front port; try another (smaller) stick
+fs_smoke says PROBLEMS       photo; usually a bad copy: copy the folder again
+black screen after launch    wait 30 s; your TV must show NTSC 60 Hz;
+                             note whether wLaunchELF itself was visible
+start-up list stops          note its last line (that step hangs)
+FATAL ERROR / CPU EXCEPTION  photo of the whole screen; reset
+"folder must be writable"    stick write-protected, full or not FAT32
+game starts benchmarking     a bench.txt is still in that folder; delete it
+wrong build name on screen   you started the ELF from the other folder
