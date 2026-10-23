@@ -56,16 +56,30 @@ for f in font.png font.fontmeta buttons_8x8.png buttons_8x8.fontmeta \
          buttons_10x10.png buttons_10x10.fontmeta buttons_12x12.png buttons_12x12.fontmeta; do
     cp "$REPO/build/vvvvvv-src/desktop_version/fonts/$f" "$OUT/fonts/"
 done
+# Patch hashes are taken from patches/ now and compared with what the build
+# tree was fetched with (build/vvvvvv-src/.ps2-source, written by --refetch)
+# and what the SDL library was built from (prefix/.ps2-patches): a stale or
+# hand-edited tree is reported instead of being labelled with wrong hashes.
+hashes() { (cd "$1" && for p in *.patch; do echo "patch $p $(sha256sum "$p" | cut -c1-16)"; done); }
+cur_v="$(hashes "$REPO/patches/vvvvvv")"
+cur_s="$(hashes "$REPO/patches/sdl2")"
+warn=()
+[[ "$cur_v" == "$(grep '^patch ' "$REPO/build/vvvvvv-src/.ps2-source")" ]] ||
+    warn+=("WARNING: build/vvvvvv-src was not fetched with the current patches/vvvvvv (stale or edited tree; rebuild with --refetch)")
+[[ "$cur_s" == "$(cat "$REPO/build/sdl2-ps2-opt/prefix/.ps2-patches" 2>/dev/null)" ]] ||
+    warn+=("WARNING: the SDL library was not built from the current patches/sdl2 (run scripts/build-sdl2-ps2.sh)")
 {
     echo "build $BUILD_ID"
-    # repository revision, "-dirty" with uncommitted changes (the patch hashes
-    # below identify the sources either way)
+    # repository revision, "-dirty" with uncommitted changes
     if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
         echo "repo $(git -C "$REPO" describe --always --dirty --abbrev=12)"
     fi
-    cat "$REPO/build/vvvvvv-src/.ps2-source"
+    grep -v '^patch ' "$REPO/build/vvvvvv-src/.ps2-source"
+    echo "$cur_v"
     echo "SDL 2.32.10 + patches/sdl2:"
-    (cd "$REPO/patches/sdl2" && for p in *.patch; do echo "patch $p $(sha256sum "$p" | cut -c1-16)"; done)
+    echo "$cur_s"
+    for w in "${warn[@]}"; do echo "$w"; done
 } > "$OUT/SOURCE.txt"
+for w in "${warn[@]}"; do echo "$w" >&2; done
 sha256sum "$OUT/VVVVVV.elf" "$OUT/VVVVVV-nomusic.elf"
 echo "staged: $OUT (add data-ps2.zip there: scripts/repack-data-zip.py data.zip data-ps2.zip)"

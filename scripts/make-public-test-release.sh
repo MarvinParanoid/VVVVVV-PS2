@@ -30,6 +30,9 @@ SYM="$PUB/VVVVVV-PS2-$NAME-symbols"
 
 grep -q "^build $EXP_ID\$" "$REPO/out/vvvvvv-ps2/SOURCE.txt" || {
     echo "out/vvvvvv-ps2 is not a $EXP_ID build: PS2_BUILD_ID=$EXP_ID scripts/build-vvvvvv-ps2.sh" >&2; exit 2; }
+if grep -q '^WARNING' "$REPO/out/vvvvvv-ps2/SOURCE.txt"; then
+    grep '^WARNING' "$REPO/out/vvvvvv-ps2/SOURCE.txt" >&2; exit 2
+fi
 if grep -q -- '-dirty$' "$REPO/out/vvvvvv-ps2/SOURCE.txt"; then
     echo "out/vvvvvv-ps2 was built from uncommitted changes; commit, rebuild, then package" >&2; exit 2
 fi

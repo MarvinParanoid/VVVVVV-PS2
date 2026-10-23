@@ -33,4 +33,6 @@ done
     cmake --build build/sdl2-ps2-opt/build -j"$(nproc)"
     cmake --install build/sdl2-ps2-opt/build >/dev/null
 '
+# which patches this library was built from (checked by build-vvvvvv-ps2.sh)
+(cd "$REPO/patches/sdl2" && for p in *.patch; do echo "patch $p $(sha256sum "$p" | cut -c1-16)"; done) > "$OUT/prefix/.ps2-patches"
 echo "installed: $OUT/prefix"

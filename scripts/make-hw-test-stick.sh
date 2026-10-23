@@ -22,6 +22,9 @@ EXP_ID="${EXP_ID:-P3.2-T1}"
 
 grep -q "^build $EXP_ID\$" "$REPO/out/vvvvvv-ps2/SOURCE.txt" || {
     echo "out/vvvvvv-ps2 is not a $EXP_ID build: PS2_BUILD_ID=$EXP_ID scripts/build-vvvvvv-ps2.sh" >&2; exit 2; }
+if grep -q '^WARNING' "$REPO/out/vvvvvv-ps2/SOURCE.txt"; then
+    grep '^WARNING' "$REPO/out/vvvvvv-ps2/SOURCE.txt" >&2; exit 2
+fi
 for e in build/ps2-tests-opt/fs_smoke.elf build/ps2-tests-opt/gs_poc_sw.elf build/ps2-tests-opt/gs_poc_gs.elf; do
     [[ -f "$REPO/$e" ]] || { echo "missing $e: scripts/build-ps2-tests.sh" >&2; exit 2; }
 done
