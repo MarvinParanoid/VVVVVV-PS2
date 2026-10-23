@@ -27,7 +27,10 @@ BUILD_ID="${PS2_BUILD_ID:-dev}"
 # Two variants: the default (streamed music) and a music-disabled build kept
 # for A/B measurements (VVVVVV-nomusic.elf). PS2_MUSIC is always passed
 # explicitly so a stale CMake cache cannot change what gets built.
+# GIT_CEILING_DIRECTORIES: VVVVVV's version.cmake embeds the git commit it
+# finds; without this it finds this repository and every commit changes the ELF.
 "$REPO/scripts/ps2-env.sh" /bin/sh -euc '
+    export GIT_CEILING_DIRECTORIES=/src/build
     P=/src/build/sdl2-ps2-opt/prefix
     for variant in music nomusic; do
         if [ $variant = music ]; then dir=build/vvvvvv-ps2; opt=ON; else dir=build/vvvvvv-ps2-nomusic; opt=OFF; fi
