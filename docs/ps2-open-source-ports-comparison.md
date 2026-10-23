@@ -290,3 +290,71 @@ None of this changes G1's verdict, which waits for hardware data. It is the refe
   - an I-cache size check on the hot blitters;
   - `-Wdouble-promotion` as a warning in our PS2 builds;
   - for a future memory card save: `icon.sys`, XMC → MC fallback, A/B writes.
+
+## 5. glampert's other repositories (2026-10-23)
+
+Of [glampert](https://github.com/glampert)'s 44 public repositories, these concern the PS2:
+- `quake-ps2` and `doom3-bfg-ps2`, covered in §2;
+- the six below.
+
+The rest (debug-draw, compression, game reverse-engineering, Rust and OpenGL demos) do not bear on the port.
+
+| Repo | Revision | What it is | Value for us |
+|---|---|---|---|
+| [quake2-ps2](https://github.com/glampert/quake2-ps2) | `f5fb890` (2026-10-22) | Quake II on libdraw/packet2 plus VU1. **The port that actually ran on a console.** The "(Q2)" facts in quake-ps2's rules come from here | **High**: a dated record of hardware-only failures (§5.1) |
+| [ps2-homebrew](https://github.com/glampert/ps2-homebrew) | `602441a` | 2015 demos (rotating cubes, a dungeon game) on his own C++ framework | Low |
+| [vu-checker](https://github.com/glampert/vu-checker), [vclpp](https://github.com/glampert/vclpp), fork of [openvcl](https://github.com/glampert/openvcl) | 2026-10 | VU1 microprogram tooling: a checker for openvcl/dvp-as silent miscompiles, a C-like preprocessor for VCL, and openvcl fixes merged upstream (PRs #7, #8) | Only if G1 ever uses VU1; our G1 PoC drives the GIF directly |
+| fork of [ps2docs](https://github.com/glampert/ps2docs) | 1 commit ahead | Sony's EE, GS, VU and SPU2 manuals converted to Markdown | A searchable reference. The texts are Sony's; do not copy them into this repository |
+| forks of ps2gl, ps2stuff | 0 commits ahead | Unmodified | None |
+
+### 5.1 quake2-ps2: the hardware session record
+
+**Hardware [D]:**
+- a **PAL fat PS2** with wLaunchELF 4.43a;
+- an HDD attached (about 90 OPL partitions);
+- a 15.8 GB FAT32 USB stick;
+- a worn DualShock 2.
+
+There are no slim-console results; our target is an SCPH-7500x slim.
+
+The failures in the order they appeared [V: commits checked]:
+
+| Date, commit | Symptom on the console | Cause and fix | Check for VVVVVV-PS2 |
+|---|---|---|---|
+| 10-06 `d688718` | Game data not found on USB | Fixed path `mass:/baseq2`. Fix: derive the folder from `argv[0]` (after the last colon), probe `mass0:`–`mass9:`, wait up to 10 s. **The error screen lists argv, the folders searched and the mounted volumes**, "because a console has no log to read" Already covered: the fatal screen shows the last errors, including "put data-ps2.zip … next to VVVVVV.elf in <path>" [V, patch 0003] |
+| 10-06 `260396b` | A slow USB level load (over 78 s) looked like a hang | Log file, per-file load trace with a heartbeat, loading screen with progress. Timeouts later raised to 150 s | Our boot console shows steps but no progress inside the asset load. Time the first USB boot (§2.4: about 900 KB/s, about 5 ms per command) |
+| 10-06 `0e010ec` | **Exception handler showed nothing on a real fault** | At exception level, printf and SIF RPC fail. Fix: copy registers, rewrite **EPC and `$sp`**, report from thread context on a private stack; retry without the stack walk if the walk faults | **Same as recommendation #1 (§3)**: our handler rewrites EPC but not `$sp`. Now confirmed by a hardware failure, not just a design note |
+| 10-07/08 `0099cda` | First pipeline hang: the log held only the error line | The register dump went to stdout | Every fatal-path print must reach our log file; check the exception report and the GS paths |
+| 10-09 `16d59d9` | Log stopped after its header | `close()` returns the slot number (§2.4) | We never test `close()==0` [V] |
+| 10-09/10 `ff74dad` | GS hang | VU1 double-buffer overrun that PCSX2 never shows. Found by decoding the DMA chain trail and dumping VU1 memory | Not applicable (no VU1) |
+| 10-10 `31e634f` | Only untextured fills drew | Missing `SyncDCache` before CLUT DMA (§2.2) | gsKit flushes before its texture DMA [V, H1.1 audit] |
+| 10-10 `a1d110f` | Walls "swam" | GS precision loss on large S/T values | Not applicable: our UVs stay within one 320×240 texture [A] |
+| 10-11 `d9f31d0`, `d0b53b4` | 56 fps on NTSC, 6.8% of frames dropped | A command-buffer overflow stalled the EE about 8.6 ms on hardware (about 2 ms in PCSX2). Fixed by continuing in the other half, then sending the world pass early. Result: 59.9 fps, GsWait 5.3 → 3.4 ms | Not applicable while the software renderer is used: the GS gets one stretched sprite per frame. It matters for G1, where a draw-heavy queue would stall like this |
+| 10-11 `aba41f3` | Music stuttered during saves, config writes and loads | The audsrv stale-ring loop. Fix: play silence until the whole ring has been rewritten, `audsrv_stop_audio`, then `audsrv_set_format` again on resume | Our SDL audio thread keeps feeding during main-thread stalls. A stall *of the audio thread itself* is the risk; recommendation #2 measures it |
+| 10-11 | Black screen at boot, never diagnosed | Seen with an HDD attached and the HDD probe skipped | Note for testers with an HDD |
+| 10-12 `eb7e4f5` | Boot took 29 s (53.6 s with a reset and a second search) | IOP reset 175 ms; **the HDD probe and PFS mount took about 7.5 s**. Fix: reuse the launcher's modules; its usbd registers as "usbd". USB boot with the HDD attached: **80 ms** | SDL always resets the IOP and loads HDD drivers [V]. Time our boot on a console with an HDD; expect several seconds |
+
+**Other hardware facts not in §2 [D]:**
+- One USB keyboard `read()` per frame while music streamed caused **259 stalls of about 314 ms** in 171 s. This confirms §2.4 with numbers. Our main thread does no per-frame file I/O [A]; keep it that way, overlay and bench included.
+- An IOP reset leaves the same window as a launcher's open pad port: PADMAN can DMA into EE memory until it is stopped. SDL resets the IOP first thing in `main()` [V], which keeps the window short.
+- `bdmfs_fatfs` `write` returns 0 instead of an error when FatFs fails. Our log writer counts `write() == len` as success [V], so a 0 is counted as a failure.
+- Load times on a console:
+  - USB, 8 KB clusters: 58.6 s;
+  - USB, 32 KB clusters and a 64 KB fileXio buffer: 40.4 s;
+  - HDD: 15.8 s.
+  - macOS formats 16 GB sticks with 8 KB clusters.
+  - Logging about 1,040 lines during a load cost about 24 s of 76 s.
+- Memory card:
+  - the BIOS browser draws transparent icon texels black;
+  - a save self-test failed two steps on console boots only (not investigated).
+- A PAL console forced to NTSC on a PAL-only TV over composite may lose colour. RGB SCART and component are fine. This matches [installing.md](installing.md).
+- Dead zone: a ramp up from zero, not a hard cutoff. A pad poll with no fresh data returns length 0; Q2 drops the analog input for that frame.
+
+### 5.2 Changes to the recommendations
+
+1. **#1 is promoted to required before any further hardware build.** A real fault produced no report until `$sp` was switched too; this was observed on hardware.
+2. **For the first hardware session** (docs only; add to [ps2-hardware-test-plan.md](ps2-hardware-test-plan.md)):
+   - time boot to title screen, noting HDD or no HDD;
+   - record the stick's cluster size;
+   - note any audio buzz during saves.
+3. **Fatal-path logging is already covered.** The exception report goes through `PS2_Log` and `PS2_LogFlushNow` [V, patch 0003], so Q2's "only the error line reached the log" failure should not recur. It can only be confirmed by a real fault, after #1.
