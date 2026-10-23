@@ -1,6 +1,8 @@
-# Hardware test plan: H1-RC2 baseline, P3.1-DEV, optional G1
+# Hardware test plan: H1-RC2 baseline, P3.2-T1, optional G1
 
 **Target:** PS2 Slim SCPH-7500x, FMCB → wLaunchELF → USB (FAT32).
+
+**This is the developer's plan** (full stick built from the repository). **Volunteer testers** use the asset-free tester release instead: its `README.txt` and `TESTING.txt` (source: `docs/tester/`) cover the same sessions in short form, and its `usb/` folders are completed with the tester's own `data.zip` by `tools/prepare-ps2-usb.py`.
 
 **Nothing in this project has run on a real PS2 yet.** All expected values below are PCSX2 measurements. Treat them as reference points, not predictions: the console may be slower or faster.
 
@@ -9,7 +11,7 @@ Do the sessions **in order**. Session 1 must be complete before the experimental
 **Contents:**
 1. Preparing the stick
 2. Session 1: H1-RC2 baseline
-3. Session 2: P3.1-DEV (experimental)
+3. Session 2: P3.2-T1 (experimental)
 4. Session 3: G1 prototypes (optional)
 5. Getting the files back
 6. Expected results (PCSX2) and what counts as a pass
@@ -19,7 +21,7 @@ Do the sessions **in order**. Session 1 must be complete before the experimental
 ## 1. Preparing the stick (on the PC)
 
 ```sh
-# needs: out/vvvvvv-ps2 built with PS2_BUILD_ID=P3.1-DEV, build/ps2-tests-opt (fs_smoke, gs_poc_*)
+# needs: out/vvvvvv-ps2 built with PS2_BUILD_ID=P3.2-T1, build/ps2-tests-opt (fs_smoke, gs_poc_*)
 scripts/make-hw-test-stick.sh ~/path/to/data.zip
 #   -> build/usb-hw/{VVVVVV, VVVVVV-P31DEV, GSPOC}
 #   it must print "release H1-RC2 unchanged" and "package A runs the frozen RC2 binary"
@@ -29,7 +31,7 @@ Copy the three folders to the **root** of a FAT32 stick (MBR partition table; ~1
 
 ```
 /VVVVVV/          package A  H1-RC2, the frozen release candidate
-/VVVVVV-P31DEV/   package B  P3.1-DEV, EXPERIMENTAL (README starts with a banner)
+/VVVVVV-P31DEV/   package B  P3.2-T1, EXPERIMENTAL (README starts with a banner)
 /GSPOC/           optional   G1 prototypes
 ```
 
@@ -47,10 +49,10 @@ sync
 
 | | Package A | Package B |
 |---|---|---|
-| First line of the start-up list | `… experimental test build H1-RC2` | `… experimental test build P3.1-DEV` |
-| Overlay status line | `STATUS OK  H1-RC2 …` | `STATUS OK  P3.1-DEV …` |
-| `vvvvvv_ps2.log` first line | `=== VVVVVV PS2, build H1-RC2 ===` | `=== VVVVVV PS2, build P3.1-DEV ===` |
-| `bench_results*.txt` header | (no build field) | `# VVVVVV PS2 benchmark, build P3.1-DEV: …` |
+| First line of the start-up list | `… experimental test build H1-RC2` | `… experimental test build P3.2-T1` |
+| Overlay status line | `STATUS OK  H1-RC2 …` | `STATUS OK  P3.2-T1 …` |
+| `vvvvvv_ps2.log` first line | `=== VVVVVV PS2, build H1-RC2 ===` | `=== VVVVVV PS2, build P3.2-T1 ===` |
+| `bench_results*.txt` header | (no build field) | `# VVVVVV PS2 benchmark, build P3.2-T1: …` |
 
 **Write down for every session:**
 - console model (sticker);
@@ -85,10 +87,10 @@ sync
    3. Reset, then **delete `VVVVVV/bench.txt`**.
 7. **Collect files:** §5.
 
-## 3. Session 2: P3.1-DEV (package B, folder `VVVVVV-P31DEV`)
+## 3. Session 2: P3.2-T1 (package B, folder `VVVVVV-P31DEV`)
 
 1. `mass:/VVVVVV-P31DEV/fs_smoke.elf` must end with **ALL OK** (this checks package B's own files). Reset.
-2. **Boot.** `mass:/VVVVVV-P31DEV/VVVVVV.elf`. The start-up list must end in **P3.1-DEV**. If it says H1-RC2, you are in the wrong folder.
+2. **Boot.** `mass:/VVVVVV-P31DEV/VVVVVV.elf`. The start-up list must end in **P3.2-T1**. If it says H1-RC2, you are in the wrong folder.
 3. **Normal gameplay.** Repeat session 1 step 4 briefly; numbers should match package A.
 4. **Flip Mode.**
    - **If it is not unlocked yet:** title → options → accessibility → **unlock play modes** → **unlock flip mode**. This writes the unlock to `VVVVVV-P31DEV/savedata/`; package A is unaffected.

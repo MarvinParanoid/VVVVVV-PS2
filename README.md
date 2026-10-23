@@ -5,7 +5,7 @@ An experimental, unofficial port of Terry Cavanagh's
 built on SDL2 and the open-source [ps2dev](https://github.com/ps2dev) toolchain.
 
 > [!IMPORTANT]
-> **This port has only been tested in the PCSX2 emulator. It has not yet run on a real PlayStation 2.**
+> **Real PS2 hardware compatibility has not yet been confirmed.** This port has only been tested in the PCSX2 emulator; it has not yet run on a real PlayStation 2.
 > Everything listed as working below was observed in PCSX2 v2.8.2. Real hardware may behave differently, and may be slower. If you have a console, a [hardware test report](#reporting-hardware-test-results) is the most useful contribution right now.
 
 > [!NOTE]
@@ -13,7 +13,11 @@ built on SDL2 and the open-source [ps2dev](https://github.com/ps2dev) toolchain.
 
 ## Status
 
-**Current milestone:** first hardware test. Release candidate `H1-RC2` is frozen and validated in PCSX2, awaiting a test on a European PS2 Slim (SCPH-7500x) via FMCB, wLaunchELF and USB.
+**Current milestone:** first hardware tests. The tester release (`H2-TEST1`) contains two builds:
+- the frozen release candidate **`H1-RC2`**, the baseline;
+- the experimental build **`P3.2-T1`**, which adds the Flip Mode speed fix.
+
+Both are validated only in PCSX2. [Testing on a real PS2](#testing-on-a-real-ps2-no-development-tools-needed) explains how to help.
 
 | Area | PCSX2 v2.8.2 | Real PS2 |
 |---|---|---|
@@ -23,6 +27,7 @@ built on SDL2 and the open-source [ps2dev](https://github.com/ps2dev) toolchain.
 | Save / continue (to the USB stick) | ✅ tested | ❓ untested |
 | Full game speed in normal rooms (29.4 ticks/s) | ✅ measured | ❓ unmeasured |
 | Tower / Panic Room worst case | ⚠️ ~25 of 29.4 ticks/s (85%) | ❓ unmeasured |
+| Flip Mode (upside-down option) | ✅ full speed in most scenes in `P3.2-T1`; slow in `H1-RC2` ([P3.1](docs/ps2-p3.1-software-renderer-edge-cases.md)) | ❓ unmeasured |
 | Error screens, overlay, benchmark, `fs_smoke` | ✅ tested | ❓ untested |
 | NTSC video output on a PAL console | — | ❓ untested |
 
@@ -178,9 +183,27 @@ PCSX2_BIOS=/path/to/your/bios.bin VVVVVV_DATA=/path/to/data-ps2.zip RUN_SECONDS=
 
 To make `data-ps2.zip` without making a full package, run `scripts/repack-data-zip.py data.zip data-ps2.zip`. Logs and screenshots go to `logs/pcsx2/`. Other options are documented at the top of each `scripts/run-*.sh`.
 
+## Testing on a real PS2 (no development tools needed)
+
+The tester release is a zip **without any game data**. You add the data from your own copy of VVVVVV on your PC, with a small Python script.
+
+**You need:**
+- a PS2 that runs homebrew (FMCB, PS2BBL or similar, with wLaunchELF);
+- a FAT32 USB stick with an MBR partition table, about 200 MB free;
+- a PC with Python 3.8+ (Windows, Linux or macOS);
+- `data.zip` from your own copy of VVVVVV.
+
+**Steps:**
+1. Download `VVVVVV-PS2-<release>.zip` from [Releases](https://github.com/MarvinParanoid/VVVVVV-PS2/releases) once a tester release is published, and unzip it.
+2. Run `python3 tools/prepare-ps2-usb.py /path/to/data.zip usb/VVVVVV usb/VVVVVV-P31DEV` (on Windows: `py tools\prepare-ps2-usb.py ...`).
+3. Copy the folders inside `usb/` to the root of the stick.
+4. Follow `TESTING.txt`. The first session takes about 15 minutes.
+
+The archive's `README.txt` has the details; the developer's version of the plan is [docs/ps2-hardware-test-plan.md](docs/ps2-hardware-test-plan.md).
+
 ## Reporting hardware test results
 
-Please open an issue with the **Hardware test report** template. Include:
+Please open an issue with the **Hardware test report** template; `TESTING.txt` lists what to collect. Include:
 - console model;
 - launcher;
 - USB stick;

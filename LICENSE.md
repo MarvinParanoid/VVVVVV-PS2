@@ -49,5 +49,16 @@ apply to anyone who **distributes built binaries**:
 PCSX2 (GPL-3.0) and the ps2dev Docker image are only **used** as tools; they are
 not part of the build output.
 
+## Tester releases (binaries)
+
+Tester releases (`scripts/make-public-test-release.sh`) ship **compiled PS2 ELF files and no game data**:
+- **No game assets.** `data.zip`, `data-ps2.zip`, graphics, sounds and music are never included. Each tester converts their own `data.zip` locally with `tools/prepare-ps2-usb.py`.
+- **What the release does include:**
+  - the VVVVVV licence text (`LICENSE-VVVVVV.md`) and the acknowledgement that VVVVVV is © Terry Cavanagh and that this is an altered, unofficial version;
+  - the notices of the libraries linked into the ELFs (`THIRD-PARTY-NOTICES.txt`);
+  - the open-source `lang/` and `fonts/` files from the VVVVVV repository.
+- **Basis.** The VVVVVV Source Code License v1.0 permits non-commercial redistribution of altered versions, under the conditions above. The VVVVVV README adds that distributing a compiled version "might need permission first". This project has **no** written permission or licence exception from Terry Cavanagh. An informal discussion about a general exception for non-commercial ports is **not** an enacted exception and is not relied on here. Releases are non-commercial and clearly marked unofficial. **Review this before publishing a release.**
+- **Notices to check manually.** For newlib, the GCC runtime and FatFs, `THIRD-PARTY-NOTICES.txt` gives links instead of full licence texts.
+
 "PlayStation" and "PS2" are trademarks of Sony Interactive Entertainment. This
 project is not affiliated with or endorsed by Sony.
