@@ -53,6 +53,11 @@ case "$rel_g" in ../*) echo "the output folder must be inside the repository for
 cp "$REPO/tests/ps2/gs_poc/README-GSPOC.txt" "$G/"
 (cd "$G" && sha256sum gs_poc_sw.elf gs_poc_gs.elf README-GSPOC.txt > MANIFEST.sha256)
 
+{
+    echo "USB test stick: copy VVVVVV, VVVVVV-P31DEV and GSPOC to the stick root"
+    for d in VVVVVV VVVVVV-P31DEV; do echo "$d: $(grep -E '^(build|repo) ' "$OUT/$d/SOURCE.txt" | tr '\n' ' ')"; done
+    (cd "$OUT" && sha256sum */*.elf)
+} > "$OUT/STICK-INFO.txt"
 (cd "$REL" && sha256sum -c --quiet SHA256SUMS) && echo "release H1-RC2 unchanged"
 cmp -s "$OUT/VVVVVV/VVVVVV.elf" "$REL/bin/VVVVVV.elf" && echo "package A runs the frozen RC2 binary"
 echo "stick layout ready in $OUT ($(du -sh "$OUT" | cut -f1)): copy VVVVVV, VVVVVV-P31DEV and GSPOC to the stick root"
