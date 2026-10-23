@@ -31,7 +31,8 @@ docker)
     if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
         docker build -t "$IMAGE_TAG" "$REPO/docker" >&2
     fi
-    exec docker run --rm -u "$(id -u):$(id -g)" -v "$REPO:/src" -w /src \
+    # HOME=/tmp as in the bwrap backend: the host user does not exist in the image
+    exec docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$REPO:/src" -w /src \
         ${DOCKER_TTY:+-it} "$IMAGE_TAG" "$@"
     ;;
 bwrap)

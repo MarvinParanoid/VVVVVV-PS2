@@ -1,0 +1,118 @@
+# Build the PS2 ELFs from a clean checkout, run the host checks and produce
+# the asset-free CI test archive. How it works and how to download the
+# results: docs/ci.md. No game data, BIOS or secrets are used or uploaded.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  host-tests:
+    name: Host reference tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install Ninja
+        run: |
+          command -v ninja || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ninja-build; }
+
+      - name: Build SDL 2.32.10 (stock and patched) and the tests for the host
+        run: scripts/build-host-tests.sh
+
+      - name: Run the tests (dummy video and audio)
+        run: scripts/run-host-tests.sh
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-test-logs
+          path: |
+            logs/host/*.log
+            logs/host/*.stdout
+          if-no-files-found: ignore
+          retention-days: 14
+
+  ps2-build:
+    name: PS2 build and tester archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PS2ENV_BACKEND: docker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # a pull request builds its head commit, not GitHub's merge commit,
+          # so the build ID names a commit that exists in the repository
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Build ID from the commit
+        id: id
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "build=ci-${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "PS2_BUILD_ID=ci-${sha:0:12}" >> "$GITHUB_ENV"
+
+      - name: Build SDL 2.32.10 with patches/sdl2
+        run: scripts/build-sdl2-ps2.sh
+
+      - name: Build VVVVVV with patches/vvvvvv
+        run: scripts/build-vvvvvv-ps2.sh --refetch
+
+      - name: Build the PS2 test programs (fs_smoke and others)
+        run: scripts/build-ps2-tests.sh
+
+      - name: Package and check the tester archive
+        env:
+          EXP_ID: ${{ steps.id.outputs.build }}
+        run: scripts/make-public-test-release.sh --ci "$EXP_ID"
+
+      - name: Collect build metadata
+        run: |
+          B=build/public
+          N="VVVVVV-PS2-${{ steps.id.outputs.build }}"
+          mkdir -p "$B/metadata"
+          cp "$B/$N/BUILD-INFO.txt" "$B/$N.zip.sha256" "$B/metadata/"
+          cp out/vvvvvv-ps2/SOURCE.txt "$B/metadata/SOURCE.txt"
+          { echo '```'; cat "$B/$N/BUILD-INFO.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the tester archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: build/public/VVVVVV-PS2-${{ steps.id.outputs.build }}.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: metadata-${{ steps.id.outputs.build }}
+          path: build/public/metadata/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload unstripped ELFs (crash symbolisation)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: symbols-${{ steps.id.outputs.build }}
+          path: build/public/VVVVVV-PS2-${{ steps.id.outputs.build }}-symbols/
+          if-no-files-found: error
+          retention-days: 30

@@ -8,7 +8,7 @@ How to build the PS2 ELFs, make a USB folder and run the game in PCSX2. To chang
 
 **Tools:** `bash`, `git`, `curl`, `patch`, `python3` (3.12+ for the bubblewrap backend; tested with 3.14), coreutils (`sha256sum`), and **either**:
 - [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): tested. The toolchain image is unpacked rootless into `~/.cache/vvvvvv-ps2/`;
-- or Docker: supported by the scripts but **not yet tested**.
+- or Docker: used by CI ([ci.md](ci.md)), not yet tested on a developer machine.
 
 **Disk and network.** About 2 GB of disk and a network connection for the first build: ~1.2 GB for the cached toolchain image and VVVVVV clone, ~0.7 GB in the repository's `build/` and `out/`. The build downloads:
 - the [ps2dev toolchain image](https://github.com/ps2dev/ps2dev/pkgs/container/ps2dev) (pinned by digest);
@@ -42,6 +42,20 @@ scripts/build-vvvvvv-ps2.sh --refetch  # VVVVVV + patches/vvvvvv     -> out/vvvv
 - `scripts/fetch-vvvvvv.sh` exports VVVVVV at the pinned commit into `build/vvvvvv-src/` and applies `patches/vvvvvv/`.
 - `scripts/build-sdl2-ps2.sh` does the same for SDL.
 - All build products stay in `build/` and `out/`, which git ignores.
+
+## Continuous integration
+
+Every push to `main` and every pull request is built by GitHub Actions with these same scripts. The run produces:
+- an asset-free tester archive named after the commit (`ci-<sha>`);
+- its checksums and build metadata;
+- the host test results.
+
+[ci.md](ci.md) covers:
+- what runs and what is checked;
+- how to download and verify an artifact;
+- how to reproduce a CI build locally;
+- how release candidates are made;
+- the planned release workflow.
 
 ## Make a USB folder
 

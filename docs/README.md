@@ -5,12 +5,13 @@
 - [installing.md](installing.md): compatibility, limitations, game data, USB stick, launching, controls, reporting results.
 - [ps2-hardware-first-boot.md](ps2-hardware-first-boot.md): printable checklist for a first session on a console.
 - [ps2-hardware-test-plan.md](ps2-hardware-test-plan.md): the developer's multi-session hardware test plan.
-- [tester/](tester/): `README.txt` and `TESTING.txt` for the tester release zip.
+- [tester/](tester/): `README.txt` and `TESTING.txt` for the tester release zip; `README-CI.txt` for CI build archives.
 - [ps2-usb-readme.txt](ps2-usb-readme.txt): the README placed in each USB folder.
 
 ## Development
 
 - [building.md](building.md): requirements, build, PCSX2.
+- [ci.md](ci.md): GitHub Actions build, artifacts, checksums and build IDs, release candidates, release workflow design.
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): patch workflow and ground rules.
 - [technical-overview.md](technical-overview.md): a short tour of the engineering work.
 - [ps2-hardware-diagnostics.md](ps2-hardware-diagnostics.md): the diagnostics overlay, its metrics and its cost.
