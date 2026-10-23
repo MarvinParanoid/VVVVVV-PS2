@@ -7,7 +7,7 @@
 #
 # - Stops after <seconds>, or earlier once vvvvvv_ps2.log says "BENCH done".
 # - Removes a previous run's vvvvvv_ps2.log and bench_results.txt from
-#   <folder> first; copies *.log, bench_results.txt, bench_*.csv and shot_*.ppm (as .png) to
+#   <folder> first; copies *.log, bench_results*.txt, bench_*.csv, prof_*.txt and shot_*.ppm (as .png) to
 #   logs/pcsx2/<log tag>/.
 # - Use a COPY of build/usb-package/VVVVVV: runs add files (savedata/, logs).
 set -euo pipefail
@@ -18,7 +18,7 @@ DIR="$(realpath "$1")" ELF="$2" TAG="$3" SECS="$4" PAD="${5:-}"
 if [[ -n "$PAD" ]]; then export PCSX2_VIRTUAL_PAD=1; fi
 source "$REPO/scripts/pcsx2-common.sh"
 # outputs of a previous run in this folder would end the wait at once
-rm -f "$DIR/vvvvvv_ps2.log" "$DIR/bench_results.txt"
+rm -f "$DIR"/vvvvvv_ps2*.log "$DIR"/bench_results*.txt
 LOGS="$REPO/logs/pcsx2/$TAG"
 mkdir -p "$LOGS"
 rm -f "${LOGS:?}"/*
@@ -39,7 +39,7 @@ done
 kill "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true
 if [[ -n "$pad_pid" ]]; then kill "$pad_pid" 2>/dev/null || true; wait "$pad_pid" 2>/dev/null || true; fi
-for f in "$DIR"/*.log "$DIR"/bench_results.txt "$DIR"/bench_*.csv; do
+for f in "$DIR"/*.log "$DIR"/bench_results*.txt "$DIR"/bench_*.csv "$DIR"/prof_*.txt; do
     [[ -f "$f" ]] && cp "$f" "$LOGS/"
 done
 for f in "$DIR"/shot_*.ppm "$DIR"/golden_*.ppm; do

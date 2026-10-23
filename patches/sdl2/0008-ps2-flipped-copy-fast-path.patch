@@ -8,7 +8,15 @@
  
  #include "SDL_draw.h"
  #include "SDL_blendfillrect.h"
-@@ -310,6 +311,128 @@
+@@ -49,6 +50,7 @@
+ {
+     SDL_Surface *surface;
+     SDL_Surface *window;
++    SDL_Surface *flip_scratch; /* SDL_SW_FLIP_FASTPATH; owned by this renderer */
+ } SW_RenderData;
+ 
+ static SDL_Surface *SW_ActivateRenderer(SDL_Renderer *renderer)
+@@ -310,6 +312,145 @@
      return retval;
  }
  
@@ -22,10 +30,25 @@
 + * without its per-call surface allocations, its ARGB8888 intermediate and the
 + * rotation. Unscaled copies mirror straight into the scratch. On by default,
 + * only together with SDL_HINT_SW_BLIT_FASTPATHS; "0" restores the previous
-+ * code exactly (A/B runs). */
++ * code exactly (A/B runs).
++ *
++ * The scratch belongs to the renderer (SW_RenderData), grows to the largest
++ * flipped copy seen and is freed with the renderer. Like the rest of a
++ * renderer it must only be used from one thread at a time. */
 +static SDL_bool sw_flip_fastpath = SDL_TRUE;
 +static SDL_bool sw_flip_fastpath_hooked = SDL_FALSE;
-+static SDL_Surface *sw_flip_scratch = NULL;
++
++/* Diagnostics for the VVVVVV PS2 port (benchmark log, flip_exact): how
++ * flipped copies were done. Not a public API; readers declare it extern, so
++ * linking them against an SDL without this patch fails. */
++typedef struct
++{
++    Uint32 fast;                   /* flipped copies done by SW_FlippedCopy */
++    Uint32 fallback;               /* flipped copies left to the code below */
++    Uint32 scratch_allocs;         /* scratch (re)allocations */
++    Uint32 scratch_alloc_failures; /* ... that failed (then: fallback) */
++} SDL_SWFlipStats;
++SDL_SWFlipStats SDL_sw_flip_stats;
 +
 +static void SDLCALL SW_FlipFastpathChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
 +{
@@ -42,11 +65,11 @@
 +}
 +
 +/* Returns SDL_TRUE when the copy was done (its result in *result). */
-+static SDL_bool SW_FlippedCopy(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *surface,
++static SDL_bool SW_FlippedCopy(SW_RenderData *data, SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *surface,
 +                               const SDL_Rect *final_rect, SDL_ScaleMode scaleMode, SDL_RendererFlip flip, int *result)
 +{
 +    const int w = final_rect->w, h = final_rect->h;
-+    SDL_Surface *scratch = sw_flip_scratch;
++    SDL_Surface *scratch = data->flip_scratch;
 +    SDL_Rect region, dst;
 +    SDL_BlendMode blendmode;
 +    Uint8 alphaMod, rMod, gMod, bMod;
@@ -62,9 +85,11 @@
 +            ch = SDL_max(ch, scratch->h);
 +        }
 +        SDL_FreeSurface(scratch);
-+        scratch = sw_flip_scratch = SDL_CreateRGBSurfaceWithFormat(0, cw, ch, 32, src->format->format);
++        scratch = data->flip_scratch = SDL_CreateRGBSurfaceWithFormat(0, cw, ch, 32, src->format->format);
++        SDL_sw_flip_stats.scratch_allocs++;
 +        if (!scratch) {
-+            return SDL_FALSE;
++            SDL_sw_flip_stats.scratch_alloc_failures++;
++            return SDL_FALSE; /* the previous code handles the copy (and any error) */
 +        }
 +    }
 +    region.x = 0;
@@ -137,25 +162,30 @@
  static int SW_RenderCopyEx(SDL_Renderer *renderer, SDL_Surface *surface, SDL_Texture *texture,
                             const SDL_Rect *srcrect, const SDL_Rect *final_rect,
                             const double angle, const SDL_FPoint *center, const SDL_RendererFlip flip, float scale_x, float scale_y)
-@@ -329,6 +452,12 @@
+@@ -329,6 +470,16 @@
          return -1;
      }
  
 +    if (SDL_SWBlitFastpathsEnabled() && SW_FlipFastpathEnabled() && angle == 0.0 && scale_x == 1.0f &&
 +        scale_y == 1.0f && flip != SDL_FLIP_NONE && src->format->BytesPerPixel == 4 && !SDL_MUSTLOCK(src) &&
-+        SW_FlippedCopy(src, srcrect, surface, final_rect, texture->scaleMode, flip, &retval)) {
++        SW_FlippedCopy((SW_RenderData *)renderer->driverdata, src, srcrect, surface, final_rect, texture->scaleMode, flip, &retval)) {
++        SDL_sw_flip_stats.fast++;
 +        return retval;
++    }
++    if (flip != SDL_FLIP_NONE) {
++        SDL_sw_flip_stats.fallback++;
 +    }
 +
      /* SDL_HINT_SW_BLIT_FASTPATHS: an unrotated, unscaled flip is a mirrored
       * copy of the source rect followed by the same blit the rotozoom path
       * ends with, so do just that (one allocation, no trig, no extra passes). */
-@@ -1157,6 +1286,8 @@
+@@ -1156,6 +1307,9 @@
+     if (window) {
          SDL_DestroyWindowSurface(window);
      }
++    if (data) {
++        SDL_FreeSurface(data->flip_scratch);
++    }
      SDL_free(data);
-+    SDL_FreeSurface(sw_flip_scratch);
-+    sw_flip_scratch = NULL;
  }
  
- int SW_CreateRendererForSurface(SDL_Renderer *renderer, SDL_Surface *surface)

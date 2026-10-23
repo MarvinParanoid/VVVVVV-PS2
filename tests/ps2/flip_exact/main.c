@@ -12,13 +12,30 @@
  * ADD, MOD; colour and alpha modulation incl. 0 and 255; sources with alpha 0,
  * 255 and in between; clipping on every edge; another target as the source;
  * LINEAR textures (must fall back). Then times VVVVVV-like streams (flipped
- * 1x and 2x bordered glyphs, a flipped full-frame copy) in OLD and NEW. */
+ * 1x and 2x bordered glyphs, a flipped full-frame copy) in OLD and NEW.
+ *
+ * P3.2 additions (lifecycle): two renderers alive at once with mixed flipped
+ * and plain copies, scratch growth and shrink, a renderer destroyed and
+ * recreated mid-stream, a flipped copy too large to allocate (must fail like
+ * the previous code and leave everything else intact), no scratch
+ * allocations in steady state, ARGB/ABGR/RGBA/BGRA/XRGB sources, a screen
+ * surface with a non-trivial pitch and an odd-width texture; fast path on vs
+ * off. SDL_sw_flip_stats (patch 0008) is read as an extern, so this test does
+ * not link against an SDL without the patch, and each mode reports which
+ * path actually ran. */
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../common/harness.h"
+
+/* patches/sdl2/0008 diagnostics (not a public API) */
+typedef struct
+{
+    Uint32 fast, fallback, scratch_allocs, scratch_alloc_failures;
+} SDL_SWFlipStats;
+extern SDL_SWFlipStats SDL_sw_flip_stats;
 
 #define W 320
 #define H 240
@@ -253,6 +270,175 @@ static double time_stream(int mode, int kind, int reps)
     return (double)(th_now_us() - t0) / reps;
 }
 
+
+/* ---- P3.2 lifecycle test ---- */
+#define LW 320
+#define LH 240
+#define LPITCH (LW * 4 + 52) /* screen pitch that is not width * 4 */
+
+typedef struct
+{
+    Uint8 *screen_px;
+    SDL_Surface *screen;
+    SDL_Renderer *r;
+    SDL_Texture *sheet, *odd, *target;
+} lctx;
+
+static void lctx_open(lctx *c, Uint32 fmt, Uint32 seed)
+{
+    rng_state = seed;
+    c->screen_px = (Uint8 *)calloc(1, (size_t)LPITCH * LH);
+    c->screen = SDL_CreateRGBSurfaceWithFormatFrom(c->screen_px, LW, LH, 32, LPITCH, SDL_PIXELFORMAT_ARGB8888);
+    c->r = SDL_CreateSoftwareRenderer(c->screen);
+    c->sheet = make_sheet(c->r, 128, 128, fmt, 0);
+    c->odd = make_sheet(c->r, 37, 29, fmt, 0); /* pitch 148 */
+    c->target = SDL_CreateTexture(c->r, fmt, SDL_TEXTUREACCESS_TARGET, LW, LH);
+    SDL_SetRenderTarget(c->r, c->target);
+    SDL_SetRenderDrawColor(c->r, 30, 60, 90, 200);
+    SDL_RenderClear(c->r);
+}
+
+/* appends target + screen pixels (ARGB8888) to out, then frees c */
+static Uint32 *lctx_close(lctx *c, Uint32 *out)
+{
+    int y;
+    SDL_SetRenderTarget(c->r, c->target);
+    SDL_RenderReadPixels(c->r, NULL, SDL_PIXELFORMAT_ARGB8888, out, LW * 4);
+    out += LW * LH;
+    SDL_SetRenderTarget(c->r, NULL);
+    SDL_SetTextureBlendMode(c->target, SDL_BLENDMODE_NONE);
+    SDL_RenderCopyEx(c->r, c->target, NULL, NULL, 0.0, NULL, SDL_FLIP_VERTICAL);
+    SDL_RenderFlush(c->r);
+    for (y = 0; y < LH; y++)
+        memcpy(out + y * LW, c->screen_px + (size_t)y * LPITCH, LW * 4);
+    out += LW * LH;
+    SDL_DestroyTexture(c->sheet);
+    SDL_DestroyTexture(c->odd);
+    SDL_DestroyTexture(c->target);
+    SDL_DestroyRenderer(c->r);
+    SDL_FreeSurface(c->screen);
+    free(c->screen_px);
+    return out;
+}
+
+/* one mixed op: flipped or plain copy of a size class, onto the target */
+static void lop(lctx *c, int size_class)
+{
+    static const SDL_RendererFlip flips[] = {SDL_FLIP_NONE, SDL_FLIP_VERTICAL, SDL_FLIP_HORIZONTAL,
+                                             (SDL_RendererFlip)(SDL_FLIP_HORIZONTAL | SDL_FLIP_VERTICAL)};
+    static const SDL_BlendMode blends[] = {SDL_BLENDMODE_BLEND, SDL_BLENDMODE_NONE, SDL_BLENDMODE_ADD, SDL_BLENDMODE_MOD};
+    SDL_Texture *src = rnd() % 4 == 0 ? c->odd : c->sheet;
+    int sw = src == c->odd ? 37 : 128, sh = src == c->odd ? 29 : 128;
+    SDL_Rect s, d;
+    int scale = size_class == 0 ? 1 : size_class == 1 ? 2 : 4;
+    s.w = size_class == 2 ? sw : 1 + (int)(rnd() % (unsigned)(sw < 16 ? sw : 16));
+    s.h = size_class == 2 ? sh : 1 + (int)(rnd() % (unsigned)(sh < 16 ? sh : 16));
+    s.x = (int)(rnd() % (unsigned)(sw - s.w + 1)), s.y = (int)(rnd() % (unsigned)(sh - s.h + 1));
+    d.w = s.w * scale, d.h = s.h * scale;
+    d.x = (int)(rnd() % (LW + d.w)) - d.w / 2, d.y = (int)(rnd() % (LH + d.h)) - d.h / 2;
+    SDL_SetRenderTarget(c->r, c->target);
+    SDL_SetTextureBlendMode(src, blends[rnd() % 4]);
+    SDL_SetTextureColorMod(src, (Uint8)rnd(), (Uint8)rnd(), (Uint8)(rnd() % 2 ? 255 : rnd()));
+    SDL_SetTextureAlphaMod(src, (Uint8)(rnd() % 3 ? 255 : rnd()));
+    SDL_RenderCopyEx(c->r, src, &s, &d, 0.0, NULL, flips[rnd() % 4]);
+}
+
+static int lifecycle_run(int fast, Uint32 fmt, Uint32 seed, Uint32 *out, Uint32 *steady_allocs, Uint32 *fail_delta,
+                         int *huge_rc)
+{
+    lctx a, b, c;
+    SDL_SWFlipStats st;
+    /* pitch above INT32: SDL refuses the surface without touching memory, on the host too */
+    SDL_Rect s = {0, 0, 16, 16}, d = {-1000, 10, 600000000, 1};
+    int i;
+    SDL_SetHint("SDL_SW_BLIT_FASTPATHS", "1");
+    SDL_SetHint("SDL_PS2_P3_FASTPATHS", "1");
+    SDL_SetHint("SDL_SW_FLIP_FASTPATH", fast ? "1" : "0");
+    lctx_open(&a, fmt, seed);
+    lctx_open(&b, fmt, seed ^ 0x55u);
+    /* growth: small, 2x, whole sheet 4x (512x512 scratch), back to small; interleaved renderers */
+    for (i = 0; i < 400; i++)
+    {
+        lop(&a, i < 100 ? 0 : i < 200 ? 1 : i < 220 ? 2 : 0);
+        lop(&b, i % 3 == 0 ? 1 : 0);
+    }
+    /* a flipped copy too large to allocate: the fast path must fail over to the previous code */
+    st = SDL_sw_flip_stats;
+    SDL_SetRenderTarget(a.r, a.target);
+    SDL_SetTextureBlendMode(a.sheet, SDL_BLENDMODE_BLEND);
+    *huge_rc = SDL_RenderCopyEx(a.r, a.sheet, &s, &d, 0.0, NULL, SDL_FLIP_VERTICAL);
+    SDL_RenderFlush(a.r);
+    *fail_delta = SDL_sw_flip_stats.scratch_alloc_failures - st.scratch_alloc_failures;
+    /* renderer a goes away mid-stream; b continues; c is new */
+    out = lctx_close(&a, out);
+    lctx_open(&c, fmt, seed ^ 0xAAu);
+    for (i = 0; i < 200; i++)
+    {
+        lop(&b, i % 2);
+        lop(&c, i % 5 == 0 ? 1 : 0);
+    }
+    /* steady state: after a warm-up at the largest size this mix uses (16x16
+     * at 2x), the same mix again must not (re)allocate scratches */
+    {
+        SDL_Rect ws = {0, 0, 16, 16}, wd = {0, 0, 32, 32};
+        SDL_SetRenderTarget(b.r, b.target);
+        SDL_RenderCopyEx(b.r, b.sheet, &ws, &wd, 0.0, NULL, SDL_FLIP_VERTICAL);
+        SDL_SetRenderTarget(c.r, c.target);
+        SDL_RenderCopyEx(c.r, c.sheet, &ws, &wd, 0.0, NULL, SDL_FLIP_VERTICAL);
+    }
+    SDL_RenderFlush(b.r);
+    SDL_RenderFlush(c.r);
+    st = SDL_sw_flip_stats;
+    for (i = 0; i < 300; i++)
+    {
+        lop(&b, i % 2);
+        lop(&c, i % 5 == 0 ? 1 : 0);
+    }
+    SDL_RenderFlush(b.r);
+    SDL_RenderFlush(c.r);
+    *steady_allocs = SDL_sw_flip_stats.scratch_allocs - st.scratch_allocs;
+    out = lctx_close(&b, out);
+    out = lctx_close(&c, out);
+    return 0;
+}
+
+static void lifecycle_tests(void)
+{
+    static const Uint32 fmts[] = {SDL_PIXELFORMAT_ARGB8888, SDL_PIXELFORMAT_ABGR8888, SDL_PIXELFORMAT_RGBA8888,
+                                  SDL_PIXELFORMAT_BGRA8888, SDL_PIXELFORMAT_XRGB8888};
+    const size_t n = (size_t)LW * LH * 6; /* 3 renderers x (target + screen) */
+    size_t f;
+    for (f = 0; f < sizeof(fmts) / sizeof(fmts[0]); f++)
+    {
+        Uint32 *on = (Uint32 *)malloc(n * 4), *off = (Uint32 *)malloc(n * 4);
+        Uint32 steady_on = 0, steady_off = 0, fail_on = 0, fail_off = 0;
+        int rc_on = 0, rc_off = 0;
+        SDL_SWFlipStats st0 = SDL_sw_flip_stats;
+        size_t first, d;
+        char name[96];
+        Uint32 fast_on;
+        lifecycle_run(1, fmts[f], 0x5EED0000u + (Uint32)f, on, &steady_on, &fail_on, &rc_on);
+        fast_on = SDL_sw_flip_stats.fast - st0.fast;
+        lifecycle_run(0, fmts[f], 0x5EED0000u + (Uint32)f, off, &steady_off, &fail_off, &rc_off);
+        d = compare(off, on, n, &first);
+        snprintf(name, sizeof(name), "lifecycle %s: fast path = previous code", SDL_GetPixelFormatName(fmts[f]));
+        th_check(name, d == 0, "%lu of %lu pixels differ", (unsigned long)d, (unsigned long)n);
+        if (d)
+            th_log("  first diff at %lu: off %08lx on %08lx", (unsigned long)first, (unsigned long)off[first],
+                   (unsigned long)on[first]);
+        snprintf(name, sizeof(name), "lifecycle %s: no scratch allocs in steady state", SDL_GetPixelFormatName(fmts[f]));
+        th_check(name, steady_on == 0, "%lu allocations", (unsigned long)steady_on);
+        snprintf(name, sizeof(name), "lifecycle %s: oversized flip falls back like before", SDL_GetPixelFormatName(fmts[f]));
+        th_check(name, rc_on == rc_off && fail_on == 1 && fail_off == 0, "rc fast %d / previous %d, scratch alloc failures %lu / %lu",
+                 rc_on, rc_off, (unsigned long)fail_on, (unsigned long)fail_off);
+        th_log("lifecycle %s: fast-path copies %lu, scratch alloc failures %lu (the oversized copy; batched, so "
+               "SDL_RenderCopyEx returns 0 on both paths and the failure only shows in this counter)",
+               SDL_GetPixelFormatName(fmts[f]), (unsigned long)fast_on, (unsigned long)fail_on);
+        free(on);
+        free(off);
+    }
+}
+
 int main(int argc, char **argv)
 {
     static const Uint32 seeds[] = {0x1234567u, 0xC0FFEEu, 0xBADF00Du};
@@ -268,9 +454,19 @@ int main(int argc, char **argv)
         for (m = 0; m < N_MODES; m++)
         {
             uint64_t t0 = th_now_us();
+            const SDL_SWFlipStats st0 = SDL_sw_flip_stats;
+            Uint32 fast, fallback;
+            char name[80];
             out[m] = render_stream(m, seeds[k]);
-            th_log("seed %08lx %-8s %d flipped copies: %lu us", (unsigned long)seeds[k], mode_name[m], NOPS,
-                   (unsigned long)(th_now_us() - t0));
+            fast = SDL_sw_flip_stats.fast - st0.fast;
+            fallback = SDL_sw_flip_stats.fallback - st0.fallback;
+            th_log("seed %08lx %-8s %d flipped copies: %lu us (fast path %lu, previous code %lu)", (unsigned long)seeds[k],
+                   mode_name[m], NOPS, (unsigned long)(th_now_us() - t0), (unsigned long)fast, (unsigned long)fallback);
+            snprintf(name, sizeof(name), "%s ran the intended path, seed %08lx", mode_name[m], (unsigned long)seeds[k]);
+            if (m == MODE_NEW || m == MODE_NEW_ARGB)
+                th_check(name, fast > (Uint32)NOPS / 2, "fast %lu fallback %lu", (unsigned long)fast, (unsigned long)fallback);
+            else
+                th_check(name, fast == 0, "fast %lu fallback %lu", (unsigned long)fast, (unsigned long)fallback);
         }
         for (m = MODE_OLD; m < N_MODES; m++)
         {
@@ -291,6 +487,10 @@ int main(int argc, char **argv)
         const double t_old = time_stream(MODE_OLD, (int)k, reps), t_new = time_stream(MODE_NEW, (int)k, reps);
         th_log("TIME %-52s OLD %8.0f us  NEW %8.0f us  (%.1fx)", kinds[k], t_old, t_new, t_old / t_new);
     }
+    lifecycle_tests();
+    th_log("flip stats total: fast %lu, previous code %lu, scratch allocs %lu, failed %lu",
+           (unsigned long)SDL_sw_flip_stats.fast, (unsigned long)SDL_sw_flip_stats.fallback,
+           (unsigned long)SDL_sw_flip_stats.scratch_allocs, (unsigned long)SDL_sw_flip_stats.scratch_alloc_failures);
     th_mem_report("end");
     th_summary();
     return th_finish();

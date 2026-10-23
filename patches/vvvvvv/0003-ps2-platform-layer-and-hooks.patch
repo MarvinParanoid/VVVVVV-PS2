@@ -44,7 +44,7 @@
 +#endif /* PS2PLATFORM_H */
 --- a/desktop_version/src/PS2Platform.cpp
 +++ b/desktop_version/src/PS2Platform.cpp
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,644 @@
 +#include "PS2Platform.h"
 +
 +#include <SDL.h>
@@ -410,6 +410,8 @@
 +    SDL_SetHint("SDL_PS2_P3_FASTPATHS", (ps2_opts & PS2_OPT_SDL_FASTPATHS) ? "1" : "0");
 +    /* P3.1: flipped copies (flip mode text and frame) without per-call surfaces */
 +    SDL_SetHint("SDL_SW_FLIP_FASTPATH", (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "1" : "0");
++    PS2_LogNow("render opts=0x%lx: P3 SDL fast paths %s, flip fast path %s", (unsigned long) ps2_opts,
++               (ps2_opts & PS2_OPT_SDL_FASTPATHS) ? "on" : "off", (ps2_opts & PS2_OPT_FLIP_FASTPATH) ? "on" : "off");
 +#ifdef VVV_MUSIC_STREAMING
 +    {
 +        int fd = open("music_soak.txt", O_RDONLY);
@@ -737,7 +739,7 @@
 +#endif /* PS2BENCH_H */
 --- a/desktop_version/src/PS2Bench.cpp
 +++ b/desktop_version/src/PS2Bench.cpp
-@@ -0,0 +1,916 @@
+@@ -0,0 +1,987 @@
 +#include "PS2Bench.h"
 +
 +#include <SDL.h>
@@ -790,6 +792,13 @@
 +} SW_RenderStats;
 +extern SW_RenderStats SW_render_stats;
 +extern int SW_render_stats_kinds;
++
++/* patch 0008: how flipped copies were done (P3.2) */
++typedef struct
++{
++    uint32_t fast, fallback, scratch_allocs, scratch_alloc_failures;
++} SDL_SWFlipStats;
++extern SDL_SWFlipStats SDL_sw_flip_stats;
 +}
 +
 +/* SDL_RenderCommandType values (SDL_sysrender.h) */
@@ -806,6 +815,12 @@
 +/* flip=1: run the scenes in Flip Mode (graphics.setflipmode, applied by
 + * startgamemode), to measure the flipped-text and flipped-frame paths */
 +static int cfg_flip;
++/* tag=NAME: suffix for every output file (bench_results_NAME.txt, CSVs,
++ * profiles, golden frames, and a copy of the log as vvvvvv_ps2_NAME.log), so
++ * several configurations can run from one folder on a console without
++ * overwriting each other (P3.2) */
++static char cfg_tag[17];
++static char tag_sfx[18]; /* "" or "_NAME" */
 +/* compact per-scene summary, written once as bench_results.txt at the end */
 +static char results[4096];
 +static size_t results_len;
@@ -837,6 +852,7 @@
 +static uint64_t loop_start_us, logic_t0, render_t0;
 +static PS2_RenderStats gs0;
 +static SW_RenderStats sw0, sw_scene0;
++static SDL_SWFlipStats flip_scene0;
 +#ifdef VVV_MUSIC_STREAMING
 +static uint64_t decode_total0;
 +static uint32_t underruns0;
@@ -1025,6 +1041,19 @@
 +        else if (strcmp(line, "scenes") == 0) SDL_strlcpy(cfg_scenes, v, sizeof(cfg_scenes));
 +        else if (strcmp(line, "overlay") == 0) cfg_overlay = atoi(v);
 +        else if (strcmp(line, "flip") == 0) cfg_flip = atoi(v);
++        else if (strcmp(line, "tag") == 0)
++        {
++            size_t k = 0;
++            for (; *v != '\0' && k < sizeof(cfg_tag) - 1; v++)
++            {
++                if ((*v >= 'a' && *v <= 'z') || (*v >= 'A' && *v <= 'Z') || (*v >= '0' && *v <= '9') || *v == '-' || *v == '_')
++                {
++                    cfg_tag[k++] = *v;
++                }
++            }
++            cfg_tag[k] = '\0';
++            SDL_snprintf(tag_sfx, sizeof(tag_sfx), "%s%s", k ? "_" : "", cfg_tag);
++        }
 +        else if (strcmp(line, "preset") == 0 && strcmp(v, "hardware") == 0)
 +        {
 +            /* the scenes asked for in H1, unchanged from P3 */
@@ -1037,12 +1066,14 @@
 +    {
 +        PS2Diag_SetOverlay(1);
 +    }
-+    result_line("# VVVVVV PS2 benchmark: settle=%d s measure=%d s over30=%d opts=0x%lx overlay=%d flip=%d\n"
++    result_line("# VVVVVV PS2 benchmark, build %s: settle=%d s measure=%d s over30=%d opts=0x%lx overlay=%d flip=%d\n"
 +                "# times in ms; tps = logic ticks per second (full speed %.1f); tps_min = slowest 1 s window\n"
 +                "# scene            tps   tps_min frame  p95    p99    max    render underruns mem_MiB\n",
-+                cfg_settle_s, cfg_measure_s, cfg_over30, (unsigned long) ps2_opts, cfg_overlay, cfg_flip, 1000.0 / 34);
-+    PS2_Log("BENCH enabled: settle=%d measure=%d over30=%d profile=%d verify=%d opts=0x%lx flip=%d scenes=%s",
++                PS2Diag_BuildId(), cfg_settle_s, cfg_measure_s, cfg_over30, (unsigned long) ps2_opts, cfg_overlay, cfg_flip,
++                1000.0 / 34);
++    PS2_Log("BENCH enabled: settle=%d measure=%d over30=%d profile=%d verify=%d opts=0x%lx flip=%d tag=%s scenes=%s",
 +            cfg_settle_s, cfg_measure_s, cfg_over30, cfg_profile, cfg_verify, (unsigned long) ps2_opts, cfg_flip,
++            cfg_tag[0] ? cfg_tag : "(none)",
 +            cfg_scenes[0] ? cfg_scenes : "(all)");
 +}
 +
@@ -1183,7 +1214,7 @@
 +static void write_csv(const char* name)
 +{
 +    char path[64];
-+    SDL_snprintf(path, sizeof(path), "bench_%02d_%s.csv", scene, name);
++    SDL_snprintf(path, sizeof(path), "bench_%02d_%s%s.csv", scene, name, tag_sfx);
 +    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 +    if (fd < 0)
 +    {
@@ -1213,7 +1244,7 @@
 +        return;
 +    }
 +    char path[64];
-+    SDL_snprintf(path, sizeof(path), "prof_%02d_%s.txt", scene, name);
++    SDL_snprintf(path, sizeof(path), "prof_%02d_%s%s.txt", scene, name, tag_sfx);
 +    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 +    if (fd < 0)
 +    {
@@ -1357,6 +1388,14 @@
 +                    cnt / r, px / r);
 +        }
 +    }
++    /* which flipped-copy path ran during the measurement, and whether the
++     * fast path allocated anything in steady state (expected: 0) */
++    PS2_Log("BENCH scene=%s flipped copies: fast=%lu fallback=%lu scratch allocs=%lu (failed %lu) | since boot: allocs=%lu",
++            name, (unsigned long) (SDL_sw_flip_stats.fast - flip_scene0.fast),
++            (unsigned long) (SDL_sw_flip_stats.fallback - flip_scene0.fallback),
++            (unsigned long) (SDL_sw_flip_stats.scratch_allocs - flip_scene0.scratch_allocs),
++            (unsigned long) (SDL_sw_flip_stats.scratch_alloc_failures - flip_scene0.scratch_alloc_failures),
++            (unsigned long) SDL_sw_flip_stats.scratch_allocs);
 +    PS2_Log("BENCH scene=%s tower/title background full redraws: %lu in %lu logic ticks", name,
 +            (unsigned long) (ps2_tower_full_redraws - tower_redraws0), (unsigned long) ticks);
 +    PS2_Log("BENCH scene=%s profile samples=%lu (%.0f Hz, handler calls %lu, counter %lld)", name, (unsigned long) prof_n,
@@ -1428,7 +1467,7 @@
 +    PS2_Log("GOLDEN scene=%s ticks=%d crc32=%08lx window_crc32=%08lx", scenes[scene].name, ticks_since_setup,
 +            (unsigned long) crc32(img, pitch * h), (unsigned long) window_crc);
 +    char path[64];
-+    SDL_snprintf(path, sizeof(path), "golden_%02d_%s.ppm", scene, scenes[scene].name);
++    SDL_snprintf(path, sizeof(path), "golden_%02d_%s%s.ppm", scene, scenes[scene].name, tag_sfx);
 +    write_ppm(path, img, w, h);
 +    free(img);
 +}
@@ -1486,11 +1525,37 @@
 +    PS2_Log("VERIFY scene=%s opts=0x%lx: %lu of %d pixels differ between reference (SDL fast paths off) and optimised render",
 +               scenes[scene].name, (unsigned long) enabled_opts, (unsigned long) diff, w * h);
 +    char path[64];
-+    SDL_snprintf(path, sizeof(path), "frame_%02d_%s.ppm", scene, scenes[scene].name);
++    SDL_snprintf(path, sizeof(path), "frame_%02d_%s%s.ppm", scene, scenes[scene].name, tag_sfx);
 +    write_ppm(path, img[1], w, h);
 +    free(img[0]);
 +    free(img[1]);
 +    graphics.set_render_target(graphics.gameTexture);
++}
++
++/* tag=: keep this run's log as vvvvvv_ps2<sfx>.log (the next launch truncates
++ * vvvvvv_ps2.log) */
++static void copy_log(const char* sfx)
++{
++    char path[48], buf[2048];
++    SDL_snprintf(path, sizeof(path), "vvvvvv_ps2%s.log", sfx);
++    const int in = open("vvvvvv_ps2.log", O_RDONLY);
++    const int out = in >= 0 ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644) : -1;
++    int n;
++    while (out >= 0 && (n = read(in, buf, sizeof(buf))) > 0)
++    {
++        if (write(out, buf, n) != n)
++        {
++            break;
++        }
++    }
++    if (out >= 0)
++    {
++        close(out);
++    }
++    if (in >= 0)
++    {
++        close(in);
++    }
 +}
 +
 +/* ---- scene driver (between frames) ---- */
@@ -1505,6 +1570,7 @@
 +{
 +    n_frames = 0;
 +    sw_scene0 = SW_render_stats;
++    flip_scene0 = SDL_sw_flip_stats;
 +    tower_redraws0 = ps2_tower_full_redraws;
 +#ifdef VVV_MUSIC_STREAMING
 +    StreamStats ms;
@@ -1571,7 +1637,9 @@
 +        {
 +            PS2_Log("BENCH done (emulated time since boot %.1f s)", now / 1e6);
 +            {
-+                int fd = open("bench_results.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
++                char rpath[48], status[80];
++                SDL_snprintf(rpath, sizeof(rpath), "bench_results%s.txt", tag_sfx);
++                int fd = open(rpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 +                if (fd >= 0)
 +                {
 +                    write(fd, results, results_len);
@@ -1579,7 +1647,12 @@
 +                }
 +                PS2_Log("BENCH results:\n%s", results);
 +                PS2_LogFlushNow();
-+                PS2Diag_SetStatus(fd >= 0 ? "BENCH DONE: see bench_results.txt" : "BENCH DONE (results file not written)");
++                if (cfg_tag[0] != '\0')
++                {
++                    copy_log(tag_sfx);
++                }
++                SDL_snprintf(status, sizeof(status), fd >= 0 ? "BENCH DONE: see %s" : "BENCH DONE (%s not written)", rpath);
++                PS2Diag_SetStatus(status);
 +                PS2Diag_SetOverlay(1);
 +            }
 +            enter(P_DONE);

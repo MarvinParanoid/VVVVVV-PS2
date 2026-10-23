@@ -58,6 +58,11 @@ for f in font.png font.fontmeta buttons_8x8.png buttons_8x8.fontmeta \
 done
 {
     echo "build $BUILD_ID"
+    # repository revision, "-dirty" with uncommitted changes (the patch hashes
+    # below identify the sources either way)
+    if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "repo $(git -C "$REPO" describe --always --dirty --abbrev=12)"
+    fi
     cat "$REPO/build/vvvvvv-src/.ps2-source"
     echo "SDL 2.32.10 + patches/sdl2:"
     (cd "$REPO/patches/sdl2" && for p in *.patch; do echo "patch $p $(sha256sum "$p" | cut -c1-16)"; done)

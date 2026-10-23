@@ -3,6 +3,12 @@
 #
 #   scripts/make-usb-package.sh <your data.zip> [<out-dir>] [--no-build] [--image <file.img>]
 #   scripts/make-usb-package.sh <your data.zip> [<out-dir>] --from-release release/VVVVVV-PS2-<ID>
+#   ... [--folder NAME] [--label TEXT]
+#
+# --folder NAME: package folder name instead of VVVVVV (e.g. VVVVVV-P31DEV for an
+# experimental build next to a release on the same stick: saves and logs are
+# written next to the ELF, so separate folders never share them).
+# --label TEXT: a banner at the top of README-PS2.txt (e.g. "EXPERIMENTAL").
 #
 # --from-release packages a frozen release candidate (scripts/freeze-release.sh)
 # exactly as it is: its stripped ELFs, game files and README; nothing is
@@ -30,13 +36,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 
-DATA_ZIP= OUT= BUILD=1 IMAGE= RELEASE=
+DATA_ZIP= OUT= BUILD=1 IMAGE= RELEASE= FOLDER=VVVVVV LABEL=
 if [[ -f "$HERE/SHA256SUMS" && -d "$HERE/bin" ]]; then RELEASE="$HERE"; fi # running the copy inside a release
 while (($#)); do
     case "$1" in
         --no-build) BUILD=0 ;;
         --from-release) RELEASE="$(cd "$2" && pwd)"; shift ;;
         --image) IMAGE="$2"; shift ;;
+        --folder) FOLDER="$2"; shift ;;
+        --label) LABEL="$2"; shift ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) if [[ -z "$DATA_ZIP" ]]; then DATA_ZIP="$1"; elif [[ -z "$OUT" ]]; then OUT="$1"; else exit 2; fi ;;
     esac
@@ -69,7 +77,8 @@ if [[ -n "$RELEASE" ]]; then
     if [[ "$HERE" == "$RELEASE" ]]; then OUT="${OUT:-$(pwd)/usb-package}"; fi
 fi
 OUT="${OUT:-$REPO/build/usb-package}"
-PKG="$OUT/VVVVVV"
+[[ "$FOLDER" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || { echo "--folder: 1-32 of [A-Za-z0-9._-]" >&2; exit 2; }
+PKG="$OUT/$FOLDER"
 
 if ((BUILD)); then
     "$REPO/scripts/build-vvvvvv-ps2.sh"
@@ -115,7 +124,12 @@ REPACK="$REPO/scripts/repack-data-zip.py"
 README="$REPO/docs/ps2-usb-readme.txt"
 fi
 python3 -I "$REPACK" "$DATA_ZIP" "$PKG/data-ps2.zip"
-cp --no-preserve=mode "$README" "$PKG/README-PS2.txt"
+if [[ -n "$LABEL" ]]; then
+    { printf '*** %s ***\n*** build: %s, folder: %s ***\n\n' "$LABEL" "$(head -1 "$PKG/SOURCE.txt")" "$FOLDER"
+      cat "$README"; } > "$PKG/README-PS2.txt"
+else
+    cp --no-preserve=mode "$README" "$PKG/README-PS2.txt"
+fi
 mkdir -p "$PKG/optional"
 printf 'preset=hardware\n' > "$PKG/optional/bench.txt"
 printf 'overlay on at start (L3+R3 toggles it)\n' > "$PKG/optional/overlay.txt"
@@ -179,4 +193,4 @@ if [[ -n "$IMAGE" ]]; then
     echo "FAT32 image: $IMAGE"
 fi
 (cd "$PKG" && sha256sum -c --quiet MANIFEST.sha256) && echo "checksums OK"
-echo "ready: $PKG  (copy the VVVVVV folder to the root of a FAT32 USB stick)"
+echo "ready: $PKG  (copy the $FOLDER folder to the root of a FAT32 USB stick)"

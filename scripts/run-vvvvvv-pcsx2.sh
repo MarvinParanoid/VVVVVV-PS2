@@ -81,7 +81,7 @@ wait "$pid" 2>/dev/null || true
 if [[ -n "$pad_pid" ]]; then kill "$pad_pid" 2>/dev/null || true; wait "$pad_pid" 2>/dev/null || true; fi
 
 cp "$RUNDIR"/vvvvvv_ps2.log "$LOGS/" 2>/dev/null || echo "[vvvvvv] no vvvvvv_ps2.log written"
-cp "$RUNDIR"/bench_*.csv "$RUNDIR"/bench_results.txt "$RUNDIR"/prof_*.txt "$LOGS/" 2>/dev/null || true
+cp "$RUNDIR"/bench_*.csv "$RUNDIR"/bench_results*.txt "$RUNDIR"/prof_*.txt "$RUNDIR"/vvvvvv_ps2_*.log "$LOGS/" 2>/dev/null || true
 for f in "$RUNDIR"/shot_*.ppm "$RUNDIR"/frame_*.ppm "$RUNDIR"/golden_*.ppm; do
     [[ -f "$f" ]] || continue
     python3 -I -c 'import sys
