@@ -64,6 +64,46 @@
 +#endif
 +
 +#endif /* PS2PLATFORM_H */
+--- a/desktop_version/src/PS2Mkdir.h
++++ b/desktop_version/src/PS2Mkdir.h
+@@ -0,0 +1,37 @@
++#ifndef PS2MKDIR_H
++#define PS2MKDIR_H
++
++/* mkdir for the PS2 port: an existing directory is not an error.
++ *
++ * The errno of a failed mkdir() cannot be trusted for this: on a USB stick
++ * (mass:) ps2sdk passes FatFs's FR_EXIST through as errno 8, not EEXIST
++ * (first console test, 2026-10-26). So after any failure, look at the path:
++ * only a directory counts as success. A file in the way, a missing parent or
++ * a read-only device still fail, with mkdir's errno restored.
++ *
++ * Returns 0 if created, 1 if a directory was already there, -1 on failure.
++ * Plain C, no PS2 headers: tests/host builds it with emulated ps2sdk errnos. */
++
++#include <errno.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++static inline int ps2_mkdir_existing_ok(const char* path, int mode)
++{
++    struct stat st;
++    int err;
++
++    if (mkdir(path, (mode_t) mode) == 0)
++    {
++        return 0;
++    }
++    err = errno;
++    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
++    {
++        return 1;
++    }
++    errno = err;
++    return -1;
++}
++
++#endif /* PS2MKDIR_H */
 --- a/desktop_version/src/PS2Platform.cpp
 +++ b/desktop_version/src/PS2Platform.cpp
 @@ -0,0 +1,872 @@
@@ -3162,7 +3202,7 @@
  
  /* These are needed for PLATFORM_* crap */
  #if defined(_WIN32)
-@@ -35,6 +39,33 @@
+@@ -35,6 +39,35 @@
  #include <sys/stat.h>
  #include <emscripten.h>
  #define MAX_PATH PATH_MAX
@@ -3170,10 +3210,12 @@
 +#include <errno.h>
 +#include <limits.h>
 +#include <sys/stat.h>
++#include "PS2Mkdir.h"
 +#define MAX_PATH PATH_MAX
 +/* PS2 device paths ("host:/x/", "mass:/x/"): some IOP filesystem drivers
-+ * reject a trailing separator, so strip it, and log failures other than
-+ * "already exists" since a missing save dir silently breaks saving. */
++ * reject a trailing separator, so strip it, and log real failures since a
++ * missing save dir silently breaks saving. An existing directory is fine
++ * (PS2Mkdir.h: its errno on a USB stick is not EEXIST). */
 +static int ps2_mkdir(const char* path, int mode)
 +{
 +    char tmp[MAX_PATH];
@@ -3185,18 +3227,18 @@
 +    {
 +        tmp[--len] = '\0';
 +    }
-+    result = mkdir(tmp, mode);
-+    if (result != 0 && errno != EEXIST)
++    result = ps2_mkdir_existing_ok(tmp, mode);
++    if (result < 0)
 +    {
 +        vlog_warn("mkdir(%s) failed: errno %d", tmp, errno);
 +    }
-+    return result;
++    return result < 0 ? -1 : 0;
 +}
 +#define mkdir ps2_mkdir
  #elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__HAIKU__) || defined(__DragonFly__) || defined(__unix__)
  #include <limits.h>
  #include <sys/stat.h>
-@@ -325,11 +356,33 @@
+@@ -325,11 +358,33 @@
              basePath,
              "data.zip"
          );
@@ -3230,7 +3272,7 @@
          vlog_error("You do not have data.zip!");
          vlog_error("Grab it from your purchased copy of the game,");
          vlog_error("or get it from the free Make and Play Edition.");
-@@ -436,10 +489,19 @@
+@@ -436,10 +491,19 @@
  
      if (!success)
      {
@@ -3250,7 +3292,7 @@
          return false;
      }
  
-@@ -863,6 +925,9 @@
+@@ -863,6 +927,9 @@
      PHYSFS_File *handle;
      PHYSFS_sint64 length;
      PHYSFS_sint64 bytes_read;
@@ -3260,7 +3302,7 @@
  
      if (name == NULL || mem == NULL)
      {
-@@ -894,6 +959,10 @@
+@@ -894,6 +961,10 @@
          return;
      }
  
@@ -3271,7 +3313,7 @@
      handle = PHYSFS_openRead(name);
      if (handle == NULL)
      {
-@@ -926,6 +995,9 @@
+@@ -926,6 +997,9 @@
          VVV_free(*mem);
      }
      PHYSFS_close(handle);

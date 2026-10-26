@@ -9,7 +9,7 @@ S=desktop_version/src
 declare -A FILES=(
   [0001-physfs-ps2-platform]="third_party/physfs/src/physfs_platforms.h third_party/physfs/src/physfs_internal.h third_party/physfs/src/physfs_platform_ps2.c third_party/physfs/src/physfs_platform_posix.c"
   [0002-cmake-ps2-target]="desktop_version/CMakeLists.txt"
-  [0003-ps2-platform-layer-and-hooks]="$S/PS2Platform.h $S/PS2Platform.cpp $S/PS2Bench.h $S/PS2Bench.cpp $S/PS2Diag.h $S/PS2Diag.cpp $S/main.cpp $S/FileSystemUtils.cpp $S/ButtonGlyphs.cpp $S/Vlogging.c"
+  [0003-ps2-platform-layer-and-hooks]="$S/PS2Platform.h $S/PS2Mkdir.h $S/PS2Platform.cpp $S/PS2Bench.h $S/PS2Bench.cpp $S/PS2Diag.h $S/PS2Diag.cpp $S/main.cpp $S/FileSystemUtils.cpp $S/ButtonGlyphs.cpp $S/Vlogging.c"
   [0004-music-streaming]="$S/Music.h $S/Music.cpp"
   [0005-ps2-render-optimisations]="$S/Graphics.h $S/Graphics.cpp $S/Screen.cpp $S/GraphicsResources.cpp $S/Game.cpp"
 )
