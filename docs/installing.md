@@ -4,20 +4,20 @@ How to put the game on a USB stick, start it on a PlayStation 2, and report what
 
 ## Compatibility
 
-The real-PS2 column comes from one console: a PlayStation 2 Slim SCPH-7500x (EU), Free McBoot, one 8 GB USB stick (MBR, FAT32), an official DualShock 2 and component video. It applies to builds from tag `H3-FIRST-HARDWARE-PLAYABLE` (build `P3.4.3-SAVEPAD`) on. **Older builds, including `H1-RC2` and `H2-TEST1`, hang on a real PS2** at the first missing file. Other models and setups are untested.
+The real-PS2 column comes from one console: a PlayStation 2 Slim SCPH-7500x (EU), Free McBoot, one 8 GB USB stick (MBR, FAT32), an official DualShock 2 and component video. It applies to builds from tag `H3-FIRST-HARDWARE-PLAYABLE` (build `P3.4.3-SAVEPAD`) on. **Older builds, including `H1-RC2` and `H2-TEST1`, hang on a real PS2** at the first missing file. Release candidate `H4-RC1` (commit `a435397`) was checked on that console on 2026-10-27: no warnings or errors in the log, saves kept across a full power-off, no leftover picture during loading. Other models and setups are untested.
 
 | Area | PCSX2 v2.8.2 | Real PS2 (SCPH-7500x, 1 console) |
 |---|---|---|
 | Boot from a USB stick folder, title screen | ✅ tested | ✅ tested; first frame ~8 s after boot |
 | Gameplay with DualShock 2 | ✅ tested (emulated pad) | ✅ D-pad, buttons and left analog stick |
 | Streamed music + sound effects | ✅ tested, 0 underruns | ✅ 0 underruns, no late audio submissions |
-| Save / continue (to the USB stick) | ✅ tested | ✅ saves written and loaded back on the next start |
+| Save / continue (to the USB stick) | ✅ tested | ✅ saves written and loaded back, also after a full power-off |
 | Full game speed in normal rooms (29.4 ticks/s) | ✅ measured | ✅ 29.5 ticks/s, 10 s minimum 29.0 |
 | Tower / Panic Room worst case | ⚠️ ~25 of 29.4 ticks/s (85%) | ❓ unmeasured |
 | Flip Mode (upside-down option) | ✅ full speed in most scenes in `P3.2-T1`; slow in `H1-RC2` ([P3.1](ps2-p3.1-software-renderer-edge-cases.md)) | ❓ unmeasured |
 | Overlay, `fs_smoke`, exception screen | ✅ tested | ✅ overlay and `fs_smoke`; the exception screen appeared once (in a build before the fixes) |
 | NTSC video output on a PAL console | — | ✅ over component video on one TV |
-| Save after a full power-off, full or write-protected stick, controller unplugged and replugged | — | ❓ untested |
+| Full or write-protected stick, controller unplugged and replugged, sessions over 30 minutes | — | ❓ untested |
 
 PCSX2 does not model the PS2's CPU caches or memory latency. On the tested console, normal rooms still run at full speed (34 ms per tick, of which about 18 ms is work). The heaviest scenes have not been measured there yet.
 
@@ -32,7 +32,7 @@ PCSX2 does not model the PS2's CPU caches or memory latency. On the tested conso
 - **NTSC only:** always 640×448 at 60 Hz, also on PAL consoles. Use a TV and cable that accept 60 Hz (RGB SCART, component). Over composite on a PAL-only TV the picture may be black and white or roll. There is no PAL mode yet.
 - **No memory-card saves.** Saves go to the USB stick only, so the game folder must be writable.
 - **USB mass storage only.** HDD, network and disc launches have not been tried.
-- **English only.** The CJK font sheets do not fit the GS texture limit.
+- **English only.** The CJK font sheets do not fit the GS texture limit. On the very first start the game still shows its language menu, with English as the only entry: press Cross. The choice is saved.
 - **Slowdown in the worst scenes.** The Tower and Panic Room run at about 85% speed in PCSX2 when the camera chases the player. Normal tower climbing is close to full speed.
 - **Music starts about 0.5 s** after a track change.
 - `over30mode` (interpolated 30+ FPS) is off by default. It can be enabled in the options but costs speed.
