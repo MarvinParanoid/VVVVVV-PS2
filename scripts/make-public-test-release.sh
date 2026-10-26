@@ -88,13 +88,25 @@ else
     cp "$REPO/docs/tester/TESTING.txt" "$T/TESTING.txt"
 fi
 cp "$REPO/LICENSES/VVVVVV-Source-Code-License.md" "$T/LICENSE-VVVVVV.md"
+# full licence texts that THIRD-PARTY-NOTICES.txt refers to
+mkdir -p "$T/LICENSES"
+for l in LGPL-2.0.txt LGPL-2.1.txt pthread-embedded-COPYING.txt FatFs.txt newlib-COPYING.NEWLIB.txt Zlib.txt MIT.txt; do
+    cp "$REPO/LICENSES/$l" "$T/LICENSES/"
+done
 {
     echo "Third-party software in the PS2 ELF files of this archive"
     echo "========================================================="
     echo
-    echo "The ELF files are statically linked. The components below keep their own"
-    echo "licences; their notices follow. VVVVVV itself: see LICENSE-VVVVVV.md."
+    echo "The ELF files are statically linked. VVVVVV itself: see LICENSE-VVVVVV.md."
     echo
+    echo "Part A lists the licence notices of the components inside the ELF files"
+    echo "(full texts here or in LICENSES/). Part B lists compliance questions that are"
+    echo "NOT resolved yet. Including a notice in part A does not mean that every"
+    echo "obligation of that licence has been reviewed."
+    echo
+    echo "======================================================================"
+    echo "PART A - licence notices included"
+    echo "======================================================================"
     notice() { printf '\n----------------------------------------------------------------------\n%s\n----------------------------------------------------------------------\n' "$1"; cat "$2"; }
     notice "SDL 2.32.10 (zlib licence), with this project's PS2 patches" "$REPO/build/sdl2-ps2-opt/src/LICENSE.txt"
     notice "PhysicsFS (zlib licence), with this project's PS2 platform patch" "$REPO/build/vvvvvv-src/third_party/physfs/LICENSE.txt"
@@ -106,11 +118,41 @@ cp "$REPO/LICENSES/VVVVVV-Source-Code-License.md" "$T/LICENSE-VVVVVV.md"
     printf '\n----------------------------------------------------------------------\nstb_vorbis (inside FAudio): public domain, or MIT at your option\n----------------------------------------------------------------------\n'
     sed -n '/^This software is available under 2 licenses/,$p' "$REPO/build/vvvvvv-src/third_party/FAudio/src/stb_vorbis.h" | sed '/^\*\//,$d'
     notice "ps2sdk (Academic Free License 2.0; some components carry other licences, see https://github.com/ps2dev/ps2sdk). gsKit (https://github.com/ps2dev/gsKit) is also licensed under the Academic Free License 2.0, the same text" "$T/.ps2sdk-license"
-    printf '\n----------------------------------------------------------------------\nOther runtime components (texts not included here; see the links)\n----------------------------------------------------------------------\n'
-    echo "- newlib C library (ps2dev toolchain): BSD-style licences, https://sourceware.org/newlib/"
+    printf '\n----------------------------------------------------------------------\nLGPL components (statically linked)\n----------------------------------------------------------------------\n'
+    echo "- pthread-embedded (ps2dev toolchain, branch platform_agnostic; derived from"
+    echo "  pthreads-win32): GNU Lesser General Public License 2.1. Texts: LICENSES/LGPL-2.1.txt,"
+    echo "  LICENSES/pthread-embedded-COPYING.txt. Source: https://github.com/ps2dev/pthread-embedded"
+    echo "- audsrv (ps2sdk audio server, EE library and IOP module): its source headers say"
+    echo "  \"GNU Library General Public License version 2\". Text: LICENSES/LGPL-2.0.txt."
+    echo "  Source: https://github.com/ps2dev/ps2sdk"
+    echo "  (Static-linking obligations of both: see part B.)"
+    printf '\n----------------------------------------------------------------------\nOther runtime components\n----------------------------------------------------------------------\n'
+    echo "- newlib C library (ps2dev toolchain): a collection of BSD-style licences,"
+    echo "  LICENSES/newlib-COPYING.NEWLIB.txt (from ps2dev/newlib ee-v4.6.0)."
+    echo "- FatFs (in the USB file system module bdmfs_fatfs): ChaN's FatFs licence,"
+    echo "  LICENSES/FatFs.txt."
     echo "- GCC runtime (libgcc, libstdc++): GPL-3.0 with the GCC Runtime Library Exception,"
     echo "  https://www.gnu.org/licenses/gcc-exception-3.1.html"
-    echo "- FatFs (in the USB file system driver): ChaN's FatFs licence (BSD-style), http://elm-chan.org/fsw/ff/"
+    echo "- tools/*.py: MIT, LICENSES/MIT.txt."
+    echo
+    echo "======================================================================"
+    echo "PART B - open compliance items (NOT resolved)"
+    echo "======================================================================"
+    echo
+    echo "1. ps2_drivers 2.0.0 (https://github.com/fjtrujy/ps2_drivers), statically linked"
+    echo "   through SDL's PS2 backend: its licence is UNRESOLVED. Its LICENSE file is the"
+    echo "   GNU GPL v3, while its source headers and README say GNU Library General Public"
+    echo "   License version 2. Clarification requested upstream:"
+    echo "   https://github.com/fjtrujy/ps2_drivers/issues/27 . No licence is assumed until"
+    echo "   the author answers. (The IOP modules it embeds are ps2sdk binaries.)"
+    echo "2. LGPL static linking (pthread-embedded, audsrv): the LGPL lets a statically"
+    echo "   linked program be distributed if users can relink it with a modified library."
+    echo "   This project intends to meet that by publishing the complete source of this"
+    echo "   port and its build scripts (https://github.com/MarvinParanoid/VVVVVV-PS2;"
+    echo "   BUILD-INFO.txt names the commit). Whether that fully satisfies LGPL 2.0/2.1"
+    echo "   section 6 has not been reviewed by a lawyer."
+    echo "3. The licences of the individual ps2sdk IOP modules embedded in the ELF files"
+    echo "   have not been checked one by one (ps2sdk is AFL 2.0 overall; audsrv is LGPL)."
 } > "$T/THIRD-PARTY-NOTICES.txt"
 rm -f "$T/.ps2sdk-license"
 
