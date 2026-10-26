@@ -12,6 +12,8 @@
 
 - [building.md](building.md): requirements, build, PCSX2.
 - [ci.md](ci.md): GitHub Actions build, artifacts, checksums and build IDs, release candidates, release workflow design.
+- [releasing.md](releasing.md): the end-user release-candidate archive (`--release`), its rules, local reproduction and CI.
+- [h4-first-public-release-plan.md](h4-first-public-release-plan.md), [license-compliance-matrix.md](license-compliance-matrix.md): first public release plan and licence matrix.
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): patch workflow and ground rules.
 - [technical-overview.md](technical-overview.md): a short tour of the engineering work.
 - [ps2-hardware-diagnostics.md](ps2-hardware-diagnostics.md): the diagnostics overlay, its metrics and its cost.

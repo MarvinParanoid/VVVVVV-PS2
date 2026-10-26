@@ -2,7 +2,9 @@
 
 How the GitHub Actions build works, what it checks, what it produces, and how release candidates and releases are made.
 
-> **Status (2026-10-23):** the workflow has **not yet run on GitHub**. Until the first run succeeds, treat this page as the design. What was verified:
+> **Status (2026-10-26):** the workflow ran on GitHub for commits `1711c68` and `fb61092` (2026-10-23), both **successful** (GitHub API). Not done yet: comparing those runs' ELF hashes with a local build of the same commit (§5). The release-candidate mode (tags `H<n>-RC<m>`, manual runs with a release name; [releasing.md](releasing.md)) and the host job's VVVVVV fetch for `fs_semantics` were added on 2026-10-26 and have **not run on GitHub yet**.
+>
+> Before the first GitHub run (2026-10-23), this was verified:
 > - `actionlint` 1.7.12 reports no problems. Shellcheck was not installed, so the shell code inside `run:` steps was not linted.
 > - The same steps ran locally with the bubblewrap backend, from a clean clone with these changes committed: build, host tests, packaging and checks all passed.
 > - The CI archive was 31 files and 3.7 MiB. Packaging it twice gave the same SHA-256.
