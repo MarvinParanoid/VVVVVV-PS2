@@ -31,6 +31,9 @@ jobs:
         run: |
           command -v ninja || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ninja-build; }
 
+      - name: Fetch VVVVVV with patches/vvvvvv (PhysicsFS for fs_semantics)
+        run: scripts/fetch-vvvvvv.sh
+
       - name: Build SDL 2.32.10 (stock and patched) and the tests for the host
         run: scripts/build-host-tests.sh
 

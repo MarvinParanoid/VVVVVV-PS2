@@ -29,4 +29,11 @@ for v in stock opt; do
         fi
     done
 done
+# PhysicsFS as the PS2 platform with ps2sdk's USB error codes emulated
+rm -f fs_semantics.log
+timeout 60 "$REPO/build/host-tests-opt/fs_semantics" > fs_semantics.stdout 2>&1
+rc=$?
+line="$(grep -E "^RESULT" fs_semantics.log 2>/dev/null)"
+echo "${line:-fs_semantics: no RESULT line (exit $rc)}"
+[[ $rc == 0 && -n "$line" ]] || { grep -E "^FAIL" fs_semantics.log; status=1; }
 exit $status

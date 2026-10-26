@@ -124,3 +124,17 @@ if(PS2 AND PS2_SDL_VARIANT STREQUAL "opt" AND EXISTS "${VVVVVV_BUILD}/libphysfs-
                           -ldebug atomic m)
     set_target_properties(sdl_bisect PROPERTIES SUFFIX ".elf")
 endif()
+
+# Host only: PhysicsFS from the patched VVVVVV tree built as the PS2 platform,
+# with ps2sdk's USB (mass:) error codes emulated (see fs_semantics/main.c).
+if(NOT PS2 AND PS2_SDL_VARIANT STREQUAL "opt" AND EXISTS "${VVVVVV_SRC}/third_party/physfs/src/physfs.c")
+    file(GLOB physfs_sources "${VVVVVV_SRC}/third_party/physfs/src/*.c")
+    add_executable(fs_semantics fs_semantics/main.c ${physfs_sources})
+    target_compile_definitions(fs_semantics PRIVATE __ps2sdk__)
+    target_compile_options(fs_semantics PRIVATE -U__linux -O1 -w)
+    target_include_directories(fs_semantics PRIVATE "${VVVVVV_SRC}/third_party/physfs/src" "${VVVVVV_SRC}/desktop_version/src")
+    foreach(w open stat lstat mkdir fsync)
+        target_link_options(fs_semantics PRIVATE "-Wl,--wrap=${w}")
+    endforeach()
+    target_link_libraries(fs_semantics PRIVATE pthread)
+endif()
