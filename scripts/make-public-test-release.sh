@@ -188,6 +188,9 @@ done
     echo "  \"GNU Library General Public License version 2\". Text: LICENSES/LGPL-2.0.txt."
     echo "  Source: https://github.com/ps2dev/ps2sdk"
     echo "  (Static-linking obligations of both: see part B.)"
+    echo "- Checked in the ps2sdk sources (commit 329e2bb, the image date): the 20 IOP modules"
+    echo "  embedded in the ELF files and the linked ps2sdk EE libraries carry the Academic"
+    echo "  Free License 2.0, except audsrv (above); gsKit: AFL 2.0."
     printf '\n----------------------------------------------------------------------\nOther runtime components\n----------------------------------------------------------------------\n'
     echo "- newlib C library (ps2dev toolchain): a collection of BSD-style licences,"
     echo "  LICENSES/newlib-COPYING.NEWLIB.txt (from ps2dev/newlib ee-v4.6.0)."
@@ -213,8 +216,6 @@ done
     echo "   port and its build scripts (https://github.com/MarvinParanoid/VVVVVV-PS2;"
     echo "   BUILD-INFO.txt names the commit). Whether that fully satisfies LGPL 2.0/2.1"
     echo "   section 6 has not been reviewed by a lawyer."
-    echo "3. The licences of the individual ps2sdk IOP modules embedded in the ELF files"
-    echo "   have not been checked one by one (ps2sdk is AFL 2.0 overall; audsrv is LGPL)."
 } > "$T/THIRD-PARTY-NOTICES.txt"
 rm -f "$T/.ps2sdk-license"
 

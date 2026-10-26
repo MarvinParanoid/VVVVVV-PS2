@@ -15,9 +15,9 @@ The binary in question is `VVVVVV.elf`: statically linked, built in ps2dev image
 | **PhysicsFS** + patch 0001 | zlib | Yes | As above | — |
 | FAudio, tinyxml2, lodepng | zlib | Yes | Keep the notices (already in `THIRD-PARTY-NOTICES.txt`) | — |
 | c-hashmap | BSD-3-Clause | Yes | Notice and disclaimer in the documentation | — |
-| SheenBidi | Apache-2.0 | Yes | Licence text; NOTICE file if present | Check for an upstream `NOTICE` file |
+| SheenBidi | Apache-2.0 | Yes | Licence text; NOTICE file if present | — (no `NOTICE` file in the pinned version) |
 | stb_vorbis (in FAudio) | Public domain or MIT | Yes | — | — |
-| **ps2sdk** EE libraries (libkernel, libcglue, fileXio, audsrv, libpadx, libmtap, libdebug/libeedebug, libpatches) and the **IRX modules** embedded in the ELF (USB, BDM, FAT, audio, pad, memory card, HDD) | Academic Free License 2.0 (`ps2sdk/LICENSE`); some modules carry other licences | Yes | Attribution notice; AFL text | Per-module licences were not audited one by one |
+| **ps2sdk** EE libraries (libkernel, libcglue, fileXio, audsrv, libpadx, libmtap, libdebug/libeedebug, libpatches) and the **IRX modules** embedded in the ELF (USB, BDM, FAT, audio, pad, memory card, HDD) | Academic Free License 2.0 (`ps2sdk/LICENSE`); some modules carry other licences | Yes | Attribution notice; AFL text | Audited 2026-10-27 at ps2sdk `329e2bb`: all 20 embedded IOP modules (mcman, mcserv, padman, mtapman, sio2man, bdm, bdmfs_fatfs, usbmass_bd, mx4sio_bd, usbd, iomanX, fileXio, libsd, ps2atad, ps2dev9, ps2hdd, ps2fs, cdfs, poweroff, audsrv) and the EE libraries are AFL 2.0, except audsrv (LGPL v2). AFL 3.0 appears only in modules not linked (hdpro_atad, smbman) |
 | **FatFs** (inside `bdmfs_fatfs.irx`) | ChaN FatFs licence (1-clause BSD style; `LICENSE.txt` of fjtrujy/FatFs `iop-r0.16`, the branch ps2sdk fetches) | Yes | None for binaries: the licence says binary redistribution does not need to mention FatFs. The text is included anyway (`LICENSES/FatFs.txt`) | — |
 | **gsKit** (libgskit, libdmakit) | AFL 2.0 | Yes | As ps2sdk | — |
 | **ps2_drivers 2.0.0** (`libps2_drivers.a`; `init_ps2_filesystem_driver`, `init_audio_driver`, `init_joystick_driver`, `waitUntilDeviceIsReady` are in the ELF; pulled in by SDL's PS2 backend) | **Contradictory:** the `LICENSE` file at tag `2.0.0` is **GPL-3.0**; the README and the source headers say **LGPL v2** ("GNU Library General Public License version 2") | **Unresolved; blocker.** If it is GPL-3.0, the combined work would have to be GPL-3.0, which conflicts with the VVVVVV licence's non-commercial clause: the binary cannot be distributed. If it is LGPL v2, static linking is allowed with relinking obligations (below) | LGPL: licence text; source of the library; let users relink (provide the complete source and build scripts, which this repository already does) | **Ask the author (fjtrujy) which licence applies (user's action).** Alternative: replace the small amount of glue we use (IRX loading and device wait) with this project's own code on ps2sdk (AFL) and drop `libps2_drivers`. Not yet assessed |
@@ -74,7 +74,7 @@ Licence evidence (fjtrujy/ps2_drivers):
 - `ps2dev/pthread-embedded` `LICENSE` and `COPYING` (master).
 - `nm` of the H3 ELF.
 
+Checked later (2026-10-27): the IRX and ps2sdk EE library headers (see the ps2sdk row); SheenBidi has no `NOTICE` file (pinned submodule `83f7710`), so its `LICENSE` is enough.
+
 Not checked:
-- per-module headers of every IRX;
-- the exact newlib parts linked;
-- SheenBidi `NOTICE`.
+- the exact newlib parts linked, and whether the image's newlib is exactly `ee-v4.6.0`.
