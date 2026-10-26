@@ -1,0 +1,35 @@
+--- a/src/joystick/ps2/SDL_sysjoystick.c
++++ b/src/joystick/ps2/SDL_sysjoystick.c
+@@ -54,6 +54,7 @@
+     uint8_t slot;
+     int8_t rumble_ready;
+     int8_t opened;
++    int8_t mode_checked; /* analog mode requested (or not available) */
+ } __attribute__((aligned(64)));
+ 
+ static uint8_t enabled_pads = 0;
+@@ -286,6 +287,24 @@
+     struct JoyInfo *info = &joyInfo[index];
+     int state = padGetState(info->port, info->slot);
+ 
++    /* A DualShock 2 starts in digital mode, where the sticks report nothing:
++     * switch it to analog (locked, so the ANALOG button cannot turn the sticks
++     * off) once per connection. The D-pad and buttons work in both modes. */
++    if (state == PAD_STATE_DISCONN) {
++        info->mode_checked = 0;
++    } else if (state == PAD_STATE_STABLE && !info->mode_checked) {
++        int modes = padInfoMode(info->port, info->slot, PAD_MODETABLE, -1);
++        info->mode_checked = 1;
++        for (i = 0; modes > 0 && i < modes; i++) {
++            if (padInfoMode(info->port, info->slot, PAD_MODETABLE, i) == PAD_TYPE_DUALSHOCK) {
++                if (padInfoMode(info->port, info->slot, PAD_MODECURID, 0) != PAD_TYPE_DUALSHOCK) {
++                    padSetMainMode(info->port, info->slot, PAD_MMODE_DUALSHOCK, PAD_MMODE_LOCK);
++                }
++                break;
++            }
++        }
++    }
++
+     if (state != PAD_STATE_DISCONN && state != PAD_STATE_EXECCMD && state != PAD_STATE_ERROR) {
+         int ret = padRead(info->port, info->slot, &buttons); /* port, slot, buttons */
+         if (ret != 0) {
