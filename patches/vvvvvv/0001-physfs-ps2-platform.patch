@@ -204,3 +204,19 @@
      allocator.Free(opaque);
  } /* __PHYSFS_platformClose */
  
+@@ -332,7 +352,15 @@
+ {
+     struct stat statbuf;
+     const int rc = follow ? stat(fname, &statbuf) : lstat(fname, &statbuf);
++#ifdef PHYSFS_PLATFORM_PS2
++    /* stat() of a missing path sets errno 1 (EPERM) on mass: and host:, which
++     * read as "permission denied" and stopped PHYSFS_stat's walk over the
++     * search path at the write dir: "lang/en" was never found in the lang/
++     * mount (console test, 2026-10-26). A failed stat means not found here. */
++    BAIL_IF(rc == -1, PHYSFS_ERR_NOT_FOUND, 0);
++#else
+     BAIL_IF(rc == -1, errcodeFromErrno(), 0);
++#endif
+ 
+     if (S_ISREG(statbuf.st_mode))
+     {
