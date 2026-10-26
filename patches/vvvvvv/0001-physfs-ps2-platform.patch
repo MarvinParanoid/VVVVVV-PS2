@@ -122,3 +122,85 @@
 +#endif /* PHYSFS_PLATFORM_PS2 */
 +
 +/* end of physfs_platform_ps2.c ... */
+--- a/third_party/physfs/src/physfs_platform_posix.c
++++ b/third_party/physfs/src/physfs_platform_posix.c
+@@ -155,6 +155,17 @@
+ } /* __PHYSFS_platformMkDir */
+ 
+ 
++#ifdef PHYSFS_PLATFORM_PS2
++/* ps2sdk file calls are never interrupted, but a failed call can leave a
++ * driver status code in errno: on a real PS2, open() of a missing file on a
++ * USB stick (mass:) sets errno 4, which is EINTR, and the retry loops below
++ * then spin forever (found on the first console test, 2026-10-26). */
++#define RETRY_EINTR(failed) 0
++#else
++#define RETRY_EINTR(failed) ((failed) && (errno == EINTR))
++#endif
++
++
+ #if !defined(O_CLOEXEC) && defined(FD_CLOEXEC)
+ static inline void set_CLOEXEC(int fildes)
+ {
+@@ -183,7 +194,7 @@
+ 
+     do {
+         fd = open(filename, mode, S_IRUSR | S_IWUSR);
+-    } while ((fd < 0) && (errno == EINTR));
++    } while (RETRY_EINTR(fd < 0));
+     BAIL_IF(fd < 0, errcodeFromErrno(), NULL);
+ 
+ #if !defined(O_CLOEXEC) && defined(FD_CLOEXEC)
+@@ -241,7 +252,7 @@
+ 
+     do {
+         rc = read(fd, buffer, (size_t) len);
+-    } while ((rc == -1) && (errno == EINTR));
++    } while (RETRY_EINTR(rc == -1));
+     BAIL_IF(rc == -1, errcodeFromErrno(), -1);
+     assert(rc >= 0);
+     assert(rc <= len);
+@@ -260,7 +271,7 @@
+ 
+     do {
+         rc = write(fd, (void *) buffer, (size_t) len);
+-    } while ((rc == -1) && (errno == EINTR));
++    } while (RETRY_EINTR(rc == -1));
+     BAIL_IF(rc == -1, errcodeFromErrno(), rc);
+     assert(rc >= 0);
+     assert(rc <= len);
+@@ -298,15 +309,24 @@
+ 
+ int __PHYSFS_platformFlush(void *opaque)
+ {
++#ifdef PHYSFS_PLATFORM_PS2
++    /* ps2sdk has no fsync (ENOSYS). Failing here made PHYSFS_close return
++     * early without closing the file, and the FAT driver only writes the
++     * file size at close(): every save was left at 0 bytes on a USB stick
++     * (console test, 2026-10-26). close() commits the file. */
++    (void) opaque;
++    return 1;
++#else
+     const int fd = *((int *) opaque);
+     int rc = -1;
+     if ((fcntl(fd, F_GETFL) & O_ACCMODE) != O_RDONLY) {
+         do {
+             rc = fsync(fd);
+-        } while ((rc == -1) && (errno == EINTR));
++        } while (RETRY_EINTR(rc == -1));
+         BAIL_IF(rc == -1, errcodeFromErrno(), 0);
+     }
+     return 1;
++#endif
+ } /* __PHYSFS_platformFlush */
+ 
+ 
+@@ -316,7 +336,7 @@
+     int rc = -1;
+     do {
+         rc = close(fd);  /* we don't check this. You should have used flush! */
+-    } while ((rc == -1) && (errno == EINTR));
++    } while (RETRY_EINTR(rc == -1));
+     allocator.Free(opaque);
+ } /* __PHYSFS_platformClose */
+ 
