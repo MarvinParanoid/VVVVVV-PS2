@@ -1,12 +1,13 @@
-VVVVVV for PlayStation 2 - unofficial test build (not hardware-validated)
-==========================================================================
+VVVVVV for PlayStation 2 - unofficial build (tested on one PS2 model so far)
+============================================================================
 
 VVVVVV is copyright Terry Cavanagh. This is an altered, unofficial version
 based on the VVVVVV source code (github.com/TerryCavanagh/VVVVVV), not made
 or endorsed by its authors. VVVVVV is a commercial game; if you enjoy it,
 please buy it at thelettervsixtim.es.
 
-This folder was made by scripts/make-usb-package.sh from your own data.zip.
+This folder was prepared from your own data.zip (tools/prepare-ps2-usb.py or
+scripts/make-usb-package.sh).
 The game data in it is yours; do not redistribute it.
 
 Contents (copy the whole VVVVVV folder to the ROOT of a FAT32 USB stick)

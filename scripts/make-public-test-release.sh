@@ -3,6 +3,7 @@
 #
 #   [EXP_ID=P3.2-T1] scripts/make-public-test-release.sh <release name>   e.g. H2-TEST1
 #   EXP_ID=<build id> scripts/make-public-test-release.sh --ci <name>     CI test build
+#   scripts/make-public-test-release.sh --release <name> [--build-root DIR]  release candidate
 #
 #   build/public/VVVVVV-PS2-<name>/        the tree that goes into the zip
 #     README.txt TESTING.txt BUILD-INFO.txt SHA256SUMS
@@ -25,31 +26,86 @@
 # only usb/VVVVVV-CI/, the build $EXP_ID from out/vvvvvv-ps2, with
 # README-CI.txt. No frozen release candidate and no GSPOC: a CI archive never
 # contains binaries it did not build.
+#
+# --release: the end-user archive of one release candidate (docs/releasing.md):
+# only usb/VVVVVV/ (game, no-music game, fs_smoke), README.txt from
+# docs/release/, BUILD-INFO.txt, licences and notices (with LICENSES/) and the
+# tools. The ELFs come from DIR (default: this repository): DIR/out/vvvvvv-ps2
+# must be a build of exactly <name> (PS2_BUILD_ID=<name>), from a clean commit
+# that DIR has checked out, and DIR/build/ps2-tests-opt/fs_smoke.elf must exist.
+# Anything else stops the script: there is no fallback to another build. No
+# frozen release candidate, experimental build, prototype or benchmark preset
+# goes in.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CI=0
-if [[ "${1:-}" == "--ci" ]]; then CI=1; shift; fi
-NAME="${1:?usage: make-public-test-release.sh [--ci] <release name, e.g. H2-TEST1>}"
+CI=0 RELMODE=0 SRCROOT="$REPO"
+if [[ "${1:-}" == "--ci" ]]; then CI=1; shift; elif [[ "${1:-}" == "--release" ]]; then RELMODE=1; shift; fi
+NAME="${1:?usage: make-public-test-release.sh [--ci | --release] <release name, e.g. H2-TEST1> [--build-root DIR]}"
+shift
+while (($#)); do
+    case "$1" in
+        --build-root) ((RELMODE)) || { echo "--build-root only with --release" >&2; exit 2; }
+                      SRCROOT="$(cd "$2" && pwd)"; shift ;;
+        *) echo "unknown argument $1" >&2; exit 2 ;;
+    esac
+    shift
+done
 [[ "$NAME" =~ ^[A-Za-z0-9._-]{1,24}$ ]] || { echo "release name: 1-24 of [A-Za-z0-9._-]" >&2; exit 2; }
 EXP_ID="${EXP_ID:-P3.2-T1}"
+if ((RELMODE)); then EXP_ID="$NAME"; fi
 REL="$REPO/release/VVVVVV-PS2-H1-RC2"
 PUB="$REPO/build/public"
 T="$PUB/VVVVVV-PS2-$NAME"
 SYM="$PUB/VVVVVV-PS2-$NAME-symbols"
 
-grep -q "^build $EXP_ID\$" "$REPO/out/vvvvvv-ps2/SOURCE.txt" || {
-    echo "out/vvvvvv-ps2 is not a $EXP_ID build: PS2_BUILD_ID=$EXP_ID scripts/build-vvvvvv-ps2.sh" >&2; exit 2; }
-if grep -q '^WARNING' "$REPO/out/vvvvvv-ps2/SOURCE.txt"; then
-    grep '^WARNING' "$REPO/out/vvvvvv-ps2/SOURCE.txt" >&2; exit 2
+SRCINFO="$SRCROOT/out/vvvvvv-ps2/SOURCE.txt"
+[[ -f "$SRCINFO" ]] || { echo "no build in $SRCROOT/out/vvvvvv-ps2" >&2; exit 2; }
+grep -q "^build $EXP_ID\$" "$SRCINFO" || {
+    echo "$SRCROOT/out/vvvvvv-ps2 is not a $EXP_ID build ($(head -1 "$SRCINFO")): PS2_BUILD_ID=$EXP_ID scripts/build-vvvvvv-ps2.sh" >&2; exit 2; }
+if grep -q '^WARNING' "$SRCINFO"; then
+    grep '^WARNING' "$SRCINFO" >&2; exit 2
 fi
-if grep -q -- '-dirty$' "$REPO/out/vvvvvv-ps2/SOURCE.txt"; then
+if grep -q -- '-dirty$' "$SRCINFO"; then
     echo "out/vvvvvv-ps2 was built from uncommitted changes; commit, rebuild, then package" >&2; exit 2
 fi
-if ((CI)); then NEEDED="fs_smoke"; DEV=VVVVVV-CI; else NEEDED="fs_smoke gs_poc_sw gs_poc_gs"; DEV=VVVVVV-P31DEV; fi
+if ((CI)); then NEEDED="fs_smoke"; DEV=VVVVVV-CI
+elif ((RELMODE)); then NEEDED="fs_smoke"; DEV=VVVVVV
+else NEEDED="fs_smoke gs_poc_sw gs_poc_gs"; DEV=VVVVVV-P31DEV; fi
 for e in $NEEDED; do
-    [[ -f "$REPO/build/ps2-tests-opt/$e.elf" ]] || { echo "missing build/ps2-tests-opt/$e.elf: scripts/build-ps2-tests.sh" >&2; exit 2; }
+    [[ -f "$SRCROOT/build/ps2-tests-opt/$e.elf" ]] || { echo "missing $SRCROOT/build/ps2-tests-opt/$e.elf: scripts/build-ps2-tests.sh" >&2; exit 2; }
 done
-if ((!CI)); then
+if ((RELMODE)); then
+    # the ELFs must come from the commit that the build root has checked out,
+    # with no uncommitted change to tracked files
+    desc="$(sed -n 's/^repo //p' "$SRCINFO")"
+    BUILT="$(git -C "$SRCROOT" rev-parse --verify -q "$desc^{commit}" 2>/dev/null)" || {
+        echo "SOURCE.txt names repo revision '$desc', unknown in $SRCROOT" >&2; exit 2; }
+    COMMIT="$(git -C "$SRCROOT" rev-parse HEAD)"
+    [[ "$BUILT" == "$COMMIT" ]] || { echo "the build is from $BUILT, but $SRCROOT is at $COMMIT: rebuild" >&2; exit 2; }
+    [[ -z "$(git -C "$SRCROOT" status --porcelain --untracked-files=no)" ]] || {
+        echo "$SRCROOT has uncommitted changes to tracked files" >&2; exit 2; }
+    # the files must be the ones those builds recorded: a replaced ELF stops here
+    for f in VVVVVV.elf VVVVVV-nomusic.elf; do
+        want="$(sed -n "s/^elf \([0-9a-f]\{64\}\)  $f\$/\1/p" "$SRCINFO")"
+        [[ -n "$want" ]] || { echo "SOURCE.txt records no checksum for $f (built by an older build script): rebuild" >&2; exit 2; }
+        [[ "$(sha256sum < "$SRCROOT/out/vvvvvv-ps2/$f" | cut -d' ' -f1)" == "$want" ]] || {
+            echo "$f differs from the file the build recorded in SOURCE.txt" >&2; exit 2; }
+        grep -qaF -- "$NAME" "$SRCROOT/out/vvvvvv-ps2/$f" || { echo "$f does not contain the build ID $NAME" >&2; exit 2; }
+    done
+    STAMP="$SRCROOT/build/ps2-tests-opt/BUILD-STAMP.txt"
+    [[ -f "$STAMP" ]] || { echo "no $STAMP (built by an older build-ps2-tests.sh): rebuild the tests" >&2; exit 2; }
+    sdesc="$(sed -n 's/^repo //p' "$STAMP")"
+    [[ "$sdesc" != *-dirty ]] && [[ "$(git -C "$SRCROOT" rev-parse --verify -q "$sdesc^{commit}" 2>/dev/null)" == "$COMMIT" ]] || {
+        echo "fs_smoke.elf was built from '$sdesc', not from clean $COMMIT: rebuild the tests" >&2; exit 2; }
+    want="$(sed -n 's/^elf \([0-9a-f]\{64\}\)  fs_smoke.elf$/\1/p' "$STAMP")"
+    [[ "$(sha256sum < "$SRCROOT/build/ps2-tests-opt/fs_smoke.elf" | cut -d' ' -f1)" == "$want" ]] || {
+        echo "fs_smoke.elf differs from the file recorded in $STAMP" >&2; exit 2; }
+    PACKAGER="$(git -C "$REPO" rev-parse HEAD)"
+    if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no -- scripts docs/release LICENSES LICENSE.md)" ]]; then
+        PACKAGER="$PACKAGER + uncommitted packaging changes (NOT for publication)"
+    fi
+fi
+if ((!CI && !RELMODE)); then
     (cd "$REL" && sha256sum -c --quiet SHA256SUMS) || { echo "release H1-RC2 modified?" >&2; exit 2; }
 fi
 rm -rf "$T" "$SYM" "$T.zip"
@@ -60,18 +116,22 @@ rel_t="$(realpath --relative-to="$REPO" "$T")"
 if ((CI)); then
     "$REPO/scripts/make-usb-package.sh" --no-data "$T/usb" --no-build --folder "$DEV" \
         --label "CI build $EXP_ID - development build, not a release candidate"
+elif ((RELMODE)); then
+    "$REPO/scripts/make-usb-package.sh" --no-data "$T/usb" --build-root "$SRCROOT" --folder "$DEV"
 else
     "$REPO/scripts/make-usb-package.sh" --no-data "$T/usb" --from-release "$REL"
     "$REPO/scripts/make-usb-package.sh" --no-data "$T/usb" --no-build --folder "$DEV" \
         --label "$EXP_ID - EXPERIMENTAL, not a release candidate"
 fi
 B="$T/usb/$DEV"
+if ((!RELMODE)); then
 printf 'preset=hardware\ntag=normal\n' > "$B/optional/bench-normal.txt"
 printf 'preset=hardware\nflip=1\ntag=flip\n' > "$B/optional/bench-flip.txt"
 printf 'preset=hardware\nflip=1\nopts=0xffffffef\ntag=flipoff\n' > "$B/optional/bench-flipoff.txt"
 rm -f "$B/optional/bench.txt"
+fi
 "$REPO/scripts/ps2-env.sh" /bin/sh -euc "cat /usr/local/ps2dev/ps2sdk/LICENSE > $rel_t/.ps2sdk-license"
-if ((!CI)); then
+if ((!CI && !RELMODE)); then
     G="$T/usb/GSPOC"
     mkdir -p "$G"
     "$REPO/scripts/ps2-env.sh" /bin/sh -euc "
@@ -83,6 +143,8 @@ fi
 cp "$REPO/scripts/prepare-ps2-usb.py" "$REPO/scripts/repack-data-zip.py" "$T/tools/"
 if ((CI)); then
     cp "$REPO/docs/tester/README-CI.txt" "$T/README.txt"
+elif ((RELMODE)); then
+    cp "$REPO/docs/release/README.txt" "$T/README.txt"
 else
     cp "$REPO/docs/tester/README.txt" "$T/README.txt"
     cp "$REPO/docs/tester/TESTING.txt" "$T/TESTING.txt"
@@ -186,6 +248,41 @@ COMMIT="$(git -C "$REPO" rev-parse HEAD)"
     echo
     echo "Full source identity (upstream commits, patch hashes): usb/$DEV/SOURCE.txt"
 } > "$T/BUILD-INFO.txt"
+elif ((RELMODE)); then
+{
+    echo "VVVVVV-PS2 $NAME - release candidate (unofficial, non-commercial)"
+    echo
+    echo "build     $NAME"
+    echo "commit    $COMMIT"
+    echo "source    https://github.com/MarvinParanoid/VVVVVV-PS2/tree/$COMMIT"
+    echo "packaged  by scripts/make-public-test-release.sh --release at $PACKAGER"
+    if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+        echo "workflow  ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/$GITHUB_RUN_ID (attempt ${GITHUB_RUN_ATTEMPT:-1}, ${GITHUB_EVENT_NAME:-}, ${GITHUB_REF:-})"
+    else
+        echo "workflow  none (local build)"
+    fi
+    echo "toolchain ghcr.io/ps2dev/ps2dev@$(sed -n 's/^DIGEST="\(.*\)"$/\1/p' "$REPO/scripts/ps2-env.sh")"
+    echo
+    echo "Hardware validation of this exact build: none recorded yet."
+    echo "The port has been played on one console (PS2 Slim SCPH-7500x, Free McBoot, USB);"
+    echo "see docs/installing.md at the commit above for what was tested."
+    echo
+    echo "usb/VVVVVV"
+    grep -E '^(build|repo|upstream) ' "$B/SOURCE.txt" | sed 's/^/          /'
+    echo
+    echo "Build tools in the toolchain container (apk):"
+    "$REPO/scripts/ps2-env.sh" /bin/sh -c 'cat /.apk-versions.txt 2>/dev/null || apk info -v 2>/dev/null' |
+        grep -E '^(build-base|cmake|make|gcc|binutils|musl|git|pkgconf|python3)-[0-9]' | sed 's/^/  /'
+    echo
+    echo "Stripped ELFs in this archive (sha256):"
+    (cd "$T" && sha256sum usb/*/*.elf)
+    echo
+    echo "Unstripped ELFs (crash symbolisation; kept with the build, not in this archive, sha256):"
+    (cd "$SRCROOT" && sha256sum out/vvvvvv-ps2/VVVVVV.elf out/vvvvvv-ps2/VVVVVV-nomusic.elf build/ps2-tests-opt/fs_smoke.elf)
+    echo
+    echo "Open compliance items (not resolved): THIRD-PARTY-NOTICES.txt, part B (ps2_drivers licence, LGPL relinking)."
+    echo "Full source identity (upstream commits, patch hashes): usb/VVVVVV/SOURCE.txt"
+} > "$T/BUILD-INFO.txt"
 else
 {
     echo "VVVVVV-PS2 tester release $NAME - unofficial, NOT validated on real PS2 hardware"
@@ -205,11 +302,12 @@ fi
 
 # unstripped ELFs for symbolising crash reports (kept locally, not in the zip)
 mkdir -p "$SYM/$EXP_ID"
-if ((!CI)); then
+if ((!CI && !RELMODE)); then
     mkdir -p "$SYM/H1-RC2"
     cp "$REL"/symbols/*.elf "$SYM/H1-RC2/"
 fi
-cp "$REPO/out/vvvvvv-ps2/VVVVVV.elf" "$REPO/out/vvvvvv-ps2/VVVVVV-nomusic.elf" "$REPO/build/ps2-tests-opt/fs_smoke.elf" "$SYM/$EXP_ID/"
+cp "$SRCROOT/out/vvvvvv-ps2/VVVVVV.elf" "$SRCROOT/out/vvvvvv-ps2/VVVVVV-nomusic.elf" "$SRCROOT/build/ps2-tests-opt/fs_smoke.elf" \
+    "$SRCROOT/out/vvvvvv-ps2/SOURCE.txt" "$SYM/$EXP_ID/"
 
 # no game data, BIOS files, secrets or caches may be in here
 python3 -I "$REPO/scripts/check-package.py" tree "$T"
@@ -237,10 +335,17 @@ print(f"{out}: {len(entries)} files, {os.path.getsize(out) / 1048576:.1f} MiB")
 EOF
 if ((CI)); then
     python3 -I "$REPO/scripts/check-package.py" zip "$T.zip" --build "$EXP_ID" --commit "$COMMIT"
+elif ((RELMODE)); then
+    python3 -I "$REPO/scripts/check-package.py" zip "$T.zip" --build "$EXP_ID" --commit "$COMMIT" --release
 else
     python3 -I "$REPO/scripts/check-package.py" zip "$T.zip"
 fi
 (cd "$PUB" && sha256sum "$(basename "$T.zip")" > "$(basename "$T.zip").sha256")
 sha256sum "$T.zip"
-echo "public tester release: $T.zip (asset-free; testers add their own data.zip)"
+if ((RELMODE)); then
+    echo "release candidate: $T.zip (asset-free; users add their own data.zip)"
+    echo "NOT for publication while compliance items are open (THIRD-PARTY-NOTICES.txt, part B)"
+else
+    echo "public tester release: $T.zip (asset-free; testers add their own data.zip)"
+fi
 echo "symbols (keep, do not publish): $SYM"

@@ -13,6 +13,10 @@
 # experimental build next to a release on the same stick: saves and logs are
 # written next to the ELF, so separate folders never share them).
 # --label TEXT: a banner at the top of README-PS2.txt (e.g. "EXPERIMENTAL").
+# --build-root DIR: take the ELFs, lang/, fonts/ and SOURCE.txt from DIR/out/vvvvvv-ps2
+# and fs_smoke from DIR/build/ps2-tests-opt instead of this repository (e.g. a
+# clean worktree that built a release candidate). Implies --no-build; DIR must be
+# inside this repository (the build container only sees the repository).
 #
 # --from-release packages a frozen release candidate (scripts/freeze-release.sh)
 # exactly as it is: its stripped ELFs, game files and README; nothing is
@@ -40,7 +44,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 
-DATA_ZIP= OUT= BUILD=1 IMAGE= RELEASE= FOLDER=VVVVVV LABEL= NODATA=0
+DATA_ZIP= OUT= BUILD=1 IMAGE= RELEASE= FOLDER=VVVVVV LABEL= NODATA=0 SRCROOT=
 if [[ -f "$HERE/SHA256SUMS" && -d "$HERE/bin" ]]; then RELEASE="$HERE"; fi # running the copy inside a release
 while (($#)); do
     case "$1" in
@@ -50,6 +54,7 @@ while (($#)); do
         --folder) FOLDER="$2"; shift ;;
         --label) LABEL="$2"; shift ;;
         --no-data) NODATA=1 ;;
+        --build-root) SRCROOT="$(cd "$2" && pwd)"; BUILD=0; shift ;;
         -*) echo "unknown option $1" >&2; exit 2 ;;
         *) if [[ -z "$DATA_ZIP" && $NODATA == 0 ]]; then DATA_ZIP="$1"; elif [[ -z "$OUT" ]]; then OUT="$1"; else exit 2; fi ;;
     esac
@@ -75,6 +80,8 @@ if [[ -n "$RELEASE" ]]; then
     if [[ "$HERE" == "$RELEASE" ]]; then OUT="${OUT:-$(pwd)/usb-package}"; fi
 fi
 OUT="${OUT:-$REPO/build/usb-package}"
+SRCROOT="${SRCROOT:-$REPO}"
+case "$(realpath --relative-to="$REPO" "$SRCROOT")" in ../*) echo "--build-root must be inside the repository" >&2; exit 2 ;; esac
 [[ "$FOLDER" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || { echo "--folder: 1-32 of [A-Za-z0-9._-]" >&2; exit 2; }
 PKG="$OUT/$FOLDER"
 
@@ -87,7 +94,7 @@ if ((BUILD)); then
         cmake --build build/ps2-tests-opt --target fs_smoke >/dev/null'
 fi
 if [[ -z "$RELEASE" ]]; then
-    for f in "$REPO/out/vvvvvv-ps2/VVVVVV.elf" "$REPO/out/vvvvvv-ps2/VVVVVV-nomusic.elf" "$REPO/build/ps2-tests-opt/fs_smoke.elf"; do
+    for f in "$SRCROOT/out/vvvvvv-ps2/VVVVVV.elf" "$SRCROOT/out/vvvvvv-ps2/VVVVVV-nomusic.elf" "$SRCROOT/build/ps2-tests-opt/fs_smoke.elf"; do
         [[ -f "$f" ]] || { echo "missing $f (run without --no-build)" >&2; exit 2; }
     done
 fi
@@ -108,14 +115,15 @@ else
 # code addresses, so crash PCs from the console can be symbolised with them.
 rel_pkg="$(realpath --relative-to="$REPO" "$PKG")"
 case "$rel_pkg" in ../*) echo "the output folder must be inside the repository for the build container" >&2; exit 2 ;; esac
+rel_src="$(realpath --relative-to="$REPO" "$SRCROOT")"
 "$REPO/scripts/ps2-env.sh" /bin/sh -euc "
     for e in out/vvvvvv-ps2/VVVVVV.elf out/vvvvvv-ps2/VVVVVV-nomusic.elf build/ps2-tests-opt/fs_smoke.elf; do
-        mips64r5900el-ps2-elf-strip -o $rel_pkg/\$(basename \$e) \$e
+        mips64r5900el-ps2-elf-strip -o $rel_pkg/\$(basename \$e) $rel_src/\$e
     done"
-cp -r "$REPO/out/vvvvvv-ps2/lang" "$REPO/out/vvvvvv-ps2/fonts" "$REPO/out/vvvvvv-ps2/SOURCE.txt" "$PKG/"
+cp -r "$SRCROOT/out/vvvvvv-ps2/lang" "$SRCROOT/out/vvvvvv-ps2/fonts" "$SRCROOT/out/vvvvvv-ps2/SOURCE.txt" "$PKG/"
 {
     echo "unstripped ELFs (for symbolising crash addresses):"
-    (cd "$REPO" && sha256sum out/vvvvvv-ps2/VVVVVV.elf out/vvvvvv-ps2/VVVVVV-nomusic.elf build/ps2-tests-opt/fs_smoke.elf)
+    (cd "$SRCROOT" && sha256sum out/vvvvvv-ps2/VVVVVV.elf out/vvvvvv-ps2/VVVVVV-nomusic.elf build/ps2-tests-opt/fs_smoke.elf)
 } >> "$PKG/SOURCE.txt"
 README="$REPO/docs/ps2-usb-readme.txt"
 fi

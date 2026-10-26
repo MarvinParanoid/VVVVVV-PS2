@@ -75,13 +75,15 @@ warn=()
     echo "build $BUILD_ID"
     # repository revision, "-dirty" with uncommitted changes
     if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-        echo "repo $(git -C "$REPO" describe --always --dirty --abbrev=12)"
+        echo "repo $(git -C "$REPO" describe --always --long --dirty --abbrev=12)"
     fi
     grep -v '^patch ' "$REPO/build/vvvvvv-src/.ps2-source"
     echo "$cur_v"
     echo "SDL 2.32.10 + patches/sdl2:"
     echo "$cur_s"
     for w in "${warn[@]}"; do echo "$w"; done
+    # the files this record belongs to (make-public-test-release.sh --release checks them)
+    (cd "$OUT" && sha256sum VVVVVV.elf VVVVVV-nomusic.elf) | sed 's/^/elf /'
 } > "$OUT/SOURCE.txt"
 for w in "${warn[@]}"; do echo "$w" >&2; done
 sha256sum "$OUT/VVVVVV.elf" "$OUT/VVVVVV-nomusic.elf"

@@ -2,7 +2,7 @@
 """Check a tester package before anyone downloads it.
 
     check-package.py tree <dir>
-    check-package.py zip <file.zip> [--build ID] [--commit SHA]
+    check-package.py zip <file.zip> [--build ID] [--commit SHA] [--release]
 
 tree: content rules only, run while the package tree is being assembled
       (scripts/make-public-test-release.sh): no game data, no BIOS or memory
@@ -14,6 +14,11 @@ zip:  the finished archive: the content rules on every entry, safe entry
       frozen release candidate, may be packaged under a CI build's name).
       --commit SHA: the folders' SOURCE.txt and BUILD-INFO.txt must name this
       repository commit, without "-dirty".
+      --release: an end-user archive (make-public-test-release.sh --release):
+      exactly one folder, usb/VVVVVV, and nothing outside an allowlist (the
+      game, the no-music game, fs_smoke, their text files, lang/, fonts/,
+      optional/overlay.txt and optional/bench.txt; at the top the README,
+      build info, checksums, licences and tools).
 
 Exits non-zero with a list of every problem found. Standard library only.
 """
@@ -31,6 +36,10 @@ BAD_EXT = (".zip", ".vvv", ".wav", ".ogg", ".mp3", ".bin", ".rom", ".nvm", ".mec
 BAD_PARTS = {".git", "__pycache__", "CMakeFiles", "logs", ".claude", ".vscode", ".idea"}
 BAD_NAMES = {"CMakeCache.txt", ".env", ".netrc", "id_rsa", "id_ed25519", "data.zip", "data-ps2.zip",
              "vvvvvv_ps2.log", "bench_results.txt", "fs_smoke.log"}
+# start-up switches of the game (PS2Platform.cpp, PS2Bench.cpp): next to an ELF
+# they turn on tests (a deliberate crash, audio stalls, benchmarks, I/O traces)
+FLAG_FILES = {"crashtest.txt", "audiostall.txt", "iodiag.txt", "music_soak.txt", "storage_real.txt",
+              "snapshots.txt", "bench.txt", "overlay.txt"}
 SECRET_RE = re.compile(rb"(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
 LOCAL_PATH_RE = re.compile(rb"/home/[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/|[A-Z]:\\\\Users\\\\")
 # files every USB folder of a package must contain
@@ -48,6 +57,10 @@ def content_problems(rel, data):
     low = name.lower()
     if low.endswith(BAD_EXT) or name in BAD_NAMES or BAD_PARTS.intersection(parts):
         out.append(f"{rel}: not allowed in a package (game data, image, cache or local file)")
+    elif low.endswith(".log") or low.startswith("bench_results"):
+        out.append(f"{rel}: log or benchmark output")
+    elif len(parts) == 3 and parts[0] == "usb" and name in FLAG_FILES:
+        out.append(f"{rel}: test switch next to the ELF (belongs in optional/, if anywhere)")
     elif low.endswith(".png") and "fonts" not in parts[:-1]:
         out.append(f"{rel}: PNG outside fonts/ (may be game graphics)")
     elif low.startswith("scph") or "bios" in low:
@@ -109,7 +122,39 @@ def source_lines(text, key):
     return [ln.split(" ", 1)[1].strip() for ln in text.splitlines() if ln.startswith(key + " ")]
 
 
-def check_zip(path, build, commit):
+# --release: the only files an end-user archive may contain
+RELEASE_TOP = {"README.txt", "BUILD-INFO.txt", "SHA256SUMS", "LICENSE-VVVVVV.md", "THIRD-PARTY-NOTICES.txt",
+               "tools/prepare-ps2-usb.py", "tools/repack-data-zip.py"}
+RELEASE_LICENSES = {"LGPL-2.0.txt", "LGPL-2.1.txt", "pthread-embedded-COPYING.txt", "FatFs.txt",
+                    "newlib-COPYING.NEWLIB.txt", "Zlib.txt", "MIT.txt"}
+RELEASE_FOLDER = {"VVVVVV.elf", "VVVVVV-nomusic.elf", "fs_smoke.elf", "SOURCE.txt", "README-PS2.txt",
+                  "optional/overlay.txt", "optional/bench.txt"}
+
+
+def release_problems(files, folders):
+    out = []
+    if folders != ["VVVVVV"]:
+        out.append(f"release: want exactly usb/VVVVVV, found {folders}")
+    for rel in files:
+        if rel in RELEASE_TOP or (rel.startswith("LICENSES/") and rel[9:] in RELEASE_LICENSES):
+            continue
+        if rel.startswith("usb/VVVVVV/"):
+            sub = rel[len("usb/VVVVVV/"):]
+            if sub in RELEASE_FOLDER or sub.startswith(("lang/", "fonts/")):
+                continue
+        out.append(f"{rel}: not part of an end-user release")
+    for l in sorted(RELEASE_LICENSES):
+        if "LICENSES/" + l not in files:
+            out.append(f"missing LICENSES/{l}")
+    notices = files.get("THIRD-PARTY-NOTICES.txt", b"").decode(errors="replace")
+    for name in ("SDL", "PhysicsFS", "pthread-embedded", "audsrv", "ps2_drivers", "ps2sdk", "FatFs", "newlib",
+                 "PART A", "PART B"):
+        if name not in notices:
+            out.append(f"THIRD-PARTY-NOTICES.txt does not mention {name}")
+    return out
+
+
+def check_zip(path, build, commit, release=False):
     problems = []
     z = zipfile.ZipFile(path)
     infos = [i for i in z.infolist() if not i.is_dir()]
@@ -180,6 +225,8 @@ def check_zip(path, build, commit):
             m = re.fullmatch(r"(?:.*-g)?([0-9a-f]{7,40})", repos[0]) if len(repos) == 1 else None
             if not m or not commit.startswith(m.group(1)):
                 problems.append(f"{base}SOURCE.txt: repo {repos}, want commit {commit[:12]} without -dirty")
+    if release:
+        problems += release_problems(files, folders)
     info = files.get("BUILD-INFO.txt", b"").decode(errors="replace")
     if commit and commit not in info:
         problems.append(f"BUILD-INFO.txt does not name commit {commit}")
@@ -198,11 +245,14 @@ def main(argv):
         if not problems:
             print("content check: no game data, BIOS files, secrets, local paths or caches")
     elif len(argv) >= 2 and argv[0] == "zip":
-        opts = dict(zip(argv[2::2], argv[3::2]))
+        rest = argv[2:]
+        release = "--release" in rest
+        rest = [a for a in rest if a != "--release"]
+        opts = dict(zip(rest[0::2], rest[1::2]))
         unknown = set(opts) - {"--build", "--commit"}
-        if unknown or len(argv) % 2:
+        if unknown or len(rest) % 2:
             sys.exit(__doc__)
-        problems = check_zip(argv[1], opts.get("--build"), opts.get("--commit"))
+        problems = check_zip(argv[1], opts.get("--build"), opts.get("--commit"), release)
     else:
         sys.exit(__doc__)
     if problems:

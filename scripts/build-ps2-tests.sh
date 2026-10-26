@@ -29,3 +29,8 @@ fi
     done
     sha256sum out/ps2-tests/*.elf
 '
+# which commit fs_smoke.elf was built from (make-public-test-release.sh --release checks it)
+{
+    echo "repo $(git -C "$REPO" describe --always --long --dirty --abbrev=12)"
+    (cd "$REPO/build/ps2-tests-opt" && sha256sum fs_smoke.elf) | sed 's/^/elf /'
+} > "$REPO/build/ps2-tests-opt/BUILD-STAMP.txt"
