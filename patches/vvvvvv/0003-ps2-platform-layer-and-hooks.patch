@@ -1,6 +1,6 @@
 --- a/desktop_version/src/PS2Platform.h
 +++ b/desktop_version/src/PS2Platform.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,63 @@
 +#ifndef PS2PLATFORM_H
 +#define PS2PLATFORM_H
 +
@@ -28,7 +28,8 @@
 +
 +/* Asset loading instrumentation (FILESYSTEM_loadAssetToMemory). */
 +uint64_t PS2_NowUs(void);
-+void PS2_LogAssetLoad(const char *name, size_t bytes, uint64_t us);
++void PS2_LogAssetBegin(const char *name); /* iodiag.txt only */
++void PS2_LogAssetLoad(const char *name, size_t bytes, long got, uint64_t us);
 +
 +void PS2_Log(const char *fmt, ...);
 +/* Benchmark support: hold back log file writes while measuring; GS snapshot. */
@@ -65,7 +66,7 @@
 +#endif /* PS2PLATFORM_H */
 --- a/desktop_version/src/PS2Platform.cpp
 +++ b/desktop_version/src/PS2Platform.cpp
-@@ -0,0 +1,839 @@
+@@ -0,0 +1,872 @@
 +#include "PS2Platform.h"
 +
 +#include <SDL.h>
@@ -107,6 +108,12 @@
 +enum { CRASH_OFF, CRASH_TRAP, CRASH_BADSP, CRASH_NESTED };
 +static int crash_test; /* crashtest.txt, TEST ONLY */
 +static bool audio_stall_test; /* audiostall.txt, TEST ONLY */
++/* iodiag.txt (hardware diagnosis of USB I/O): "sync" (default) writes the
++ * log from the calling thread after every line, so no second thread touches
++ * the stick; "nolog" never writes the log file. Asset opens are logged and
++ * shown on the boot console. */
++enum { IODIAG_OFF, IODIAG_SYNC, IODIAG_NOLOG };
++static int iodiag_mode;
 +static uint32_t render_since_loop; /* render time inside the current loop */
 +static char log_copy[PS2_LOG_SIZE];
 +static size_t log_copy_len;
@@ -138,6 +145,8 @@
 +
 +static void log_write_file(const char *buf, size_t len)
 +{
++    if (iodiag_mode == IODIAG_NOLOG)
++        return;
 +    int fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 +    bool ok = false;
 +    if (fd >= 0)
@@ -253,7 +262,7 @@
 +    }
 +    memcpy(log_buf + log_len, line, n);
 +    log_len += n;
-+    if (!log_deferred && (flush || PS2_NowUs() - log_last_flush > (on_real_storage ? 10000000u : 2000000u)))
++    if (!log_deferred && (flush || iodiag_mode == IODIAG_SYNC || PS2_NowUs() - log_last_flush > (on_real_storage ? 10000000u : 2000000u)))
 +        log_flush();
 +    log_lock_give();
 +}
@@ -395,11 +404,24 @@
 +        snapshots_enabled = fd >= 0;
 +        if (fd >= 0)
 +            close(fd);
-+        start_log_writer();
++        fd = open("iodiag.txt", O_RDONLY);
++        if (fd >= 0)
++        {
++            char mode[16] = {0};
++            read(fd, mode, sizeof(mode) - 1);
++            close(fd);
++            iodiag_mode = SDL_strncmp(mode, "nolog", 5) == 0 ? IODIAG_NOLOG : IODIAG_SYNC;
++            PS2Diag_Stage("iodiag: %s", iodiag_mode == IODIAG_NOLOG ? "no log file" : "log written after every line");
++        }
++        else
++        {
++            start_log_writer();
++        }
 +    }
 +    PS2_LogNow("=== VVVVVV PS2, build %s ===", PS2Diag_BuildId());
 +    PS2_LogNow("argv0=%s cwd=%s storage=%s log=%s snapshots=%s", argc > 0 ? argv[0] : "(none)", cwd,
-+               on_real_storage ? "real (USB/MC/HDD)" : "host", log_writer_tid >= 0 ? "async, 10 s" : "sync, 2 s",
++               on_real_storage ? "real (USB/MC/HDD)" : "host",
++               log_writer_tid >= 0 ? "async, 10 s" : iodiag_mode == IODIAG_SYNC ? "sync, every line (iodiag)" : "sync, 2 s",
 +               snapshots_enabled ? "on" : "off (create snapshots.txt to enable)");
 +    log_memory("boot");
 +
@@ -523,9 +545,21 @@
 +        PS2Diag_Message('E', SDL_GetError());
 +}
 +
-+void PS2_LogAssetLoad(const char *name, size_t bytes, uint64_t us)
++void PS2_LogAssetBegin(const char *name)
 +{
-+    PS2_Log("ASSET %-40s %8lu B %7lu us", name, (unsigned long) bytes, (unsigned long) us);
++    if (iodiag_mode != IODIAG_OFF)
++    {
++        PS2_Log("ASSET open %s", name);
++        PS2Diag_Progress(name);
++    }
++}
++
++void PS2_LogAssetLoad(const char *name, size_t bytes, long got, uint64_t us)
++{
++    if (got != (long) bytes)
++        PS2_Log("ASSET %-40s %8lu B %7lu us SHORT READ: got %ld", name, (unsigned long) bytes, (unsigned long) us, got);
++    else
++        PS2_Log("ASSET %-40s %8lu B %7lu us", name, (unsigned long) bytes, (unsigned long) us);
 +}
 +
 +void PS2_RenderBegin(void)
@@ -1964,7 +1998,7 @@
 +}
 --- a/desktop_version/src/PS2Diag.h
 +++ b/desktop_version/src/PS2Diag.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,55 @@
 +#ifndef PS2DIAG_H
 +#define PS2DIAG_H
 +
@@ -1986,6 +2020,7 @@
 +
 +void PS2Diag_Init(void); /* boot console + exception screen; first thing in PS2_PreInit */
 +void PS2Diag_Stage(const char *fmt, ...);
++void PS2Diag_Progress(const char *what); /* iodiag.txt: file being read (boot console) */
 +void PS2Diag_RendererReady(void); /* the game owns the GS from now on */
 +void PS2Diag_Message(char level, const char *text); /* from vlog_*: 'E', 'W', 'I' */
 +const char *PS2Diag_LastError(void);
@@ -2021,7 +2056,7 @@
 +#endif /* PS2DIAG_H */
 --- a/desktop_version/src/PS2Diag.cpp
 +++ b/desktop_version/src/PS2Diag.cpp
-@@ -0,0 +1,896 @@
+@@ -0,0 +1,907 @@
 +#include "PS2Diag.h"
 +
 +#include <SDL.h>
@@ -2384,6 +2419,17 @@
 +    {
 +        save_text_screen("shot_boot_console.ppm");
 +    }
++}
++
++/* iodiag.txt: the file being read, on the boot console's last row */
++void PS2Diag_Progress(const char *what)
++{
++    if (!console_active)
++        return;
++    char text[80];
++    SDL_snprintf(text, sizeof(text), "reading %-60.60s", what);
++    text_at(37, GREY, text);
++    show_row(37);
 +}
 +
 +void PS2Diag_RendererReady(void)
@@ -3183,22 +3229,23 @@
  
      if (name == NULL || mem == NULL)
      {
-@@ -894,6 +950,9 @@
+@@ -894,6 +950,10 @@
          return;
      }
  
 +#ifdef __PS2__
 +    ps2_t0 = PS2_NowUs();
++    PS2_LogAssetBegin(name);
 +#endif
      handle = PHYSFS_openRead(name);
      if (handle == NULL)
      {
-@@ -926,6 +985,9 @@
+@@ -926,6 +986,9 @@
          VVV_free(*mem);
      }
      PHYSFS_close(handle);
 +#ifdef __PS2__
-+    PS2_LogAssetLoad(name, (size_t) length, PS2_NowUs() - ps2_t0);
++    PS2_LogAssetLoad(name, (size_t) length, (long) bytes_read, PS2_NowUs() - ps2_t0);
 +#endif
      return;
  
