@@ -3012,7 +3012,7 @@
      if (SDL_IsTextInputActive() == SDL_TRUE)
      {
          SDL_StopTextInput();
-@@ -680,13 +699,23 @@
+@@ -680,13 +699,34 @@
          ScreenSettings_default(&screen_settings);
          game.loadstats(&screen_settings);
          game.loadsettings(&screen_settings);
@@ -3021,6 +3021,17 @@
 +#endif
          gameScreen.init(&screen_settings);
 +#ifdef __PS2__
++        /* The GS shows the new framebuffer at once, but nothing is drawn
++         * until the resources are loaded (seconds from USB) and VRAM still
++         * holds the previous program's picture (OSDSYS/FMCB, seen on the
++         * console; PCSX2 starts with clear VRAM). Show black frames, one per
++         * buffer. */
++        for (int i = 0; i < 2; i++)
++        {
++            SDL_SetRenderDrawColor(gameScreen.m_renderer, 0, 0, 0, 255);
++            SDL_RenderClear(gameScreen.m_renderer);
++            SDL_RenderPresent(gameScreen.m_renderer);
++        }
 +        PS2Diag_RendererReady();
 +        PS2Diag_Stage("renderer ready");
 +#endif
@@ -3036,7 +3047,7 @@
      // This loads music too...
      if (!graphics.reloadresources())
      {
-@@ -711,6 +740,9 @@
+@@ -711,6 +751,9 @@
      game.createmenu(Menu::mainmenu);
  
      graphics.create_buffers();
@@ -3046,7 +3057,7 @@
  
      if (game.skipfakeload)
          game.gamestate = TITLEMODE;
-@@ -880,7 +912,13 @@
+@@ -880,7 +923,13 @@
          timePrev = time_;
          time_ = SDL_GetTicks64();
  
@@ -3060,7 +3071,7 @@
      }
  
      cleanup();
-@@ -913,6 +951,14 @@
+@@ -913,6 +962,14 @@
  
  SDL_NORETURN void VVV_exit(const int exit_code)
  {
@@ -3075,7 +3086,7 @@
      cleanup();
      exit(exit_code);
  }
-@@ -925,6 +971,12 @@
+@@ -925,6 +982,12 @@
  
      Uint32 timesteplimit = game.get_timestep();
  
@@ -3088,7 +3099,7 @@
      while (accumulator >= timesteplimit)
      {
          enum IndexCode index_code = increment_func_index();
-@@ -936,10 +988,16 @@
+@@ -936,10 +999,16 @@
  
          accumulator = SDL_fmodf(accumulator, timesteplimit);
  
@@ -3105,7 +3116,7 @@
      }
      const float alpha = game.over30mode ? static_cast<float>(accumulator) / timesteplimit : 1.0f;
      graphics.alpha = alpha;
-@@ -958,13 +1016,32 @@
+@@ -958,13 +1027,32 @@
  
          if (implfunc->type == Func_delta && implfunc->func != NULL)
          {
