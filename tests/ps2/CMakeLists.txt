@@ -81,3 +81,46 @@ if(PS2)
     target_link_libraries(fs_smoke PRIVATE -lps2_drivers -lpatches -ldebug)
     set_target_properties(fs_smoke PROPERTIES SUFFIX ".elf")
 endif()
+
+# First console test (2026-10-26): USB reads fail in the game after SDL_Init
+# but not in fs_smoke. io_bisect adds SDL's IOP subsystems one at a time.
+if(PS2)
+    add_executable(io_bisect io_bisect/main.c)
+    target_compile_options(io_bisect PRIVATE -O2 -Wall -Wextra)
+    target_link_libraries(io_bisect PRIVATE -lps2_drivers -lpatches -laudsrv -lpadx -lmtap -ldebug)
+    set_target_properties(io_bisect PROPERTIES SUFFIX ".elf")
+    # sdl_bisect hung in PhysicsFS's stat() of a missing file
+    add_executable(stat_probe stat_probe/main.c)
+    target_compile_options(stat_probe PRIVATE -O2 -Wall -Wextra)
+    target_link_libraries(stat_probe PRIVATE -lps2_drivers -lpatches -ldebug)
+    set_target_properties(stat_probe PROPERTIES SUFFIX ".elf")
+    # stat_probe passed; trace every libc file call PhysicsFS makes
+    if(EXISTS "${VVVVVV_BUILD}/libphysfs-static.a")
+        add_executable(physfs_probe physfs_probe/main.c)
+        target_compile_options(physfs_probe PRIVATE -O2 -Wall -Wextra)
+        target_include_directories(physfs_probe PRIVATE "${VVVVVV_SRC}/third_party/physfs/src")
+        set(wraps open close read write lseek stat lstat fstat opendir readdir closedir mkdir access fcntl fsync remove)
+        foreach(w ${wraps})
+            target_link_options(physfs_probe PRIVATE "-Wl,--wrap=${w}")
+        endforeach()
+        target_link_libraries(physfs_probe PRIVATE "${VVVVVV_BUILD}/libphysfs-static.a" -lps2_drivers -lpatches -ldebug)
+        set_target_properties(physfs_probe PROPERTIES SUFFIX ".elf")
+        # P3.4.2 runs, but save files stay at 0 bytes: write variants
+        add_executable(write_probe write_probe/main.c)
+        target_compile_options(write_probe PRIVATE -O2 -Wall -Wextra)
+        target_include_directories(write_probe PRIVATE "${VVVVVV_SRC}/third_party/physfs/src")
+        target_link_libraries(write_probe PRIVATE "${VVVVVV_BUILD}/libphysfs-static.a" -lps2_drivers -lpatches -ldebug)
+        set_target_properties(write_probe PROPERTIES SUFFIX ".elf")
+    endif()
+endif()
+
+# io_bisect passed on the console; sdl_bisect repeats the game's start-up
+# (SDL_Init, priority 64, PhysicsFS, audio device, renderer, music thread).
+if(PS2 AND PS2_SDL_VARIANT STREQUAL "opt" AND EXISTS "${VVVVVV_BUILD}/libphysfs-static.a")
+    add_executable(sdl_bisect sdl_bisect/main.c)
+    target_compile_options(sdl_bisect PRIVATE -O2 -Wall -Wextra)
+    target_include_directories(sdl_bisect PRIVATE "${VVVVVV_SRC}/third_party/physfs/src")
+    target_link_libraries(sdl_bisect PRIVATE SDL2::SDL2main SDL2::SDL2-static "${VVVVVV_BUILD}/libphysfs-static.a"
+                          -ldebug atomic m)
+    set_target_properties(sdl_bisect PROPERTIES SUFFIX ".elf")
+endif()
