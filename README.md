@@ -3,7 +3,9 @@
 An unofficial, non-commercial homebrew port of Terry Cavanagh's
 [VVVVVV](https://github.com/TerryCavanagh/VVVVVV) to the PlayStation 2, built
 from the open-source VVVVVV code with SDL2 and the [ps2dev](https://github.com/ps2dev) toolchain.
-It is playable in the PCSX2 emulator. **It has not yet been tested on a real PS2.**
+It runs on a real PlayStation 2: so far tested on **one console** (PS2 Slim
+SCPH-7500x, Free McBoot, USB stick), at full game speed with music and saves.
+It is also playable in the PCSX2 emulator.
 
 The game's graphics, sounds and music are not included. You need `data.zip`
 from your own copy of VVVVVV; if you enjoy the game, please buy it at
@@ -11,16 +13,23 @@ from your own copy of VVVVVV; if you enjoy the game, please buy it at
 
 ## Status
 
-Working in PCSX2:
+Working on the tested console and in PCSX2:
 - the full game in English, including time trials, the Secret Lab and the Super Gravitron;
 - music and sound effects;
-- DualShock 2 controls;
+- DualShock 2 controls: D-pad, buttons and the left analog stick;
 - saves to the USB stick;
 - diagnostic tools for hardware testing: start-up and error screens, a performance overlay, a benchmark and a USB self-test.
 
+First results on the console: 29.5 game ticks per second against the game's
+29.4, no audio dropouts, saves written and loaded back. The first console
+sessions found five bugs that PCSX2 cannot show: start-up hang, empty save
+files, dead analog stick, a missing language entry and leftover video memory
+at start-up. All five are fixed. Builds from before these fixes, including
+`H1-RC2` and `H2-TEST1`, hang on a real PS2.
+
 Main limitations:
-- Nothing has been checked on a console yet. PCSX2 does not emulate the PS2's caches, so a real PS2 may be slower.
-- The most demanding scenes (the Tower, the Panic Room) run at about 85% speed in PCSX2.
+- Only one console model, one USB stick and one controller have been tested.
+- The most demanding scenes (the Tower, the Panic Room) run at about 85% speed in PCSX2; they have not been measured on the console yet.
 - Video is NTSC (60 Hz) only, also on PAL consoles.
 - Saves go to the USB stick; there are no memory-card saves.
 
@@ -44,8 +53,9 @@ A printable checklist for a first session: [docs/ps2-hardware-first-boot.md](doc
 
 ### Testing on real hardware
 
-A report from a real console is the most useful contribution right now, and
-failures are as useful as successes. Please open an issue with the
+A report from a real console is the most useful contribution right now,
+especially from other models (fat consoles, other regions, other USB sticks).
+Failures are as useful as successes. Please open an issue with the
 **Hardware test report** template. Never attach game data; see
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -95,6 +105,6 @@ Credits:
 - **Prior art:** the VVVVVV ports to Dreamcast ([VVVVVVDC](https://github.com/gusarba/VVVVVVDC)) and other constrained platforms were studied for design ideas. No code was taken from them.
 
 Development uses AI-assisted coding tools, with builds and behavior validated
-through automated tests and PCSX2.
+through automated tests, PCSX2 and sessions on a real PS2.
 
 "PlayStation" and "PS2" are trademarks of Sony Interactive Entertainment.
