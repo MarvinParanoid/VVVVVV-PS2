@@ -1,13 +1,22 @@
 # Build the PS2 ELFs from a clean checkout, run the host checks and produce
 # the asset-free CI test archive. How it works and how to download the
 # results: docs/ci.md. No game data, BIOS or secrets are used or uploaded.
+# A tag H<n>-RC<m> (or a manual run with a release name) builds that release
+# candidate's end-user archive instead (docs/releasing.md). It is uploaded as
+# a workflow artifact only: nothing is published as a GitHub release.
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+    tags: ['H*-RC*']
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release candidate name (e.g. H4-RC1); empty for a CI build'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -65,13 +74,22 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - name: Build ID from the commit
+      - name: Build ID from the commit, the tag or the release name
         id: id
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_INPUT: ${{ github.event.inputs.release }}
         run: |
           sha="$(git rev-parse HEAD)"
+          mode=ci build="ci-${sha:0:12}"
+          if [[ "$REF_TYPE" == tag ]]; then mode=release build="$REF_NAME"
+          elif [[ -n "$RELEASE_INPUT" ]]; then mode=release build="$RELEASE_INPUT"; fi
+          [[ "$build" =~ ^[A-Za-z0-9._-]{1,24}$ ]] || { echo "bad build name: $build" >&2; exit 1; }
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "build=ci-${sha:0:12}" >> "$GITHUB_OUTPUT"
-          echo "PS2_BUILD_ID=ci-${sha:0:12}" >> "$GITHUB_ENV"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "PS2_BUILD_ID=$build" >> "$GITHUB_ENV"
 
       - name: Build SDL 2.32.10 with patches/sdl2
         run: scripts/build-sdl2-ps2.sh
@@ -82,10 +100,16 @@ jobs:
       - name: Build the PS2 test programs (fs_smoke and others)
         run: scripts/build-ps2-tests.sh
 
-      - name: Package and check the tester archive
+      - name: Package and check the archive (CI test build or release candidate)
         env:
           EXP_ID: ${{ steps.id.outputs.build }}
-        run: scripts/make-public-test-release.sh --ci "$EXP_ID"
+          MODE: ${{ steps.id.outputs.mode }}
+        run: |
+          if [[ "$MODE" == release ]]; then
+            scripts/make-public-test-release.sh --release "$EXP_ID"
+          else
+            scripts/make-public-test-release.sh --ci "$EXP_ID"
+          fi
 
       - name: Collect build metadata
         run: |
