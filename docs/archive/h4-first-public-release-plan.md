@@ -80,6 +80,7 @@ The build ID line in `SOURCE.txt` reads `repo H2-TEST1-6-gfb6109296cc8-dirty`. R
 | s4 | `sdl_bisect`, `stat_probe` | hang in the first PhysicsFS open of a missing file before `SDL_Init`; `open()` of a missing file → errno 4 |
 | s5 | P3.4.2-EINTR, `write_probe` | **playable**; saves 0 bytes; plain `write`+`close` correct in every variant, only PhysicsFS writes 0 bytes |
 | s6 | P3.4.3-SAVEPAD | saves written (qsave 2508 B, unlock 2214 B, settings 1675 B) and loaded at the next start ("Continue" restored room 112,104); analog stick works |
+| s7 (2026-10-27) | **H4-RC1** (commit `a435397`, zip `15c94a35…`, stick folder `VVVVVV-H4RC1` = the zip's `usb/VVVVVV` prepared with `prepare-ps2-usb.py`) | log (last launch only): 0 WARN/ERROR lines; saves loaded at start (qsave 2521 B, unlock 2214 B, settings 1675 B); Continue restored room (112,103); `lang_set=2` in settings; 34.3 ms period, 17–18 ms work; 0 music underruns, 0 late audsrv submissions, minimum queue 74 ms; first frame 7.95 s. Tester report: saves survive a full power-off; no VRAM picture during loading |
 
 Performance on the console, P3.4.3 (overlay photos and log):
 
@@ -94,7 +95,7 @@ Performance on the console, P3.4.3 (overlay photos and log):
 | USB log writes | 29 OK, 0 failed |
 | First frame | 8.4 s after boot |
 
-Total play time on hardware is short: about 5 minutes in s5 and a few minutes in s6.
+Total play time on hardware is short: about 5 minutes in s5, a few minutes in s6 and s7. The s7 log covers only the last launch (about 30 s of play; the log file is rewritten at every start).
 
 ## 3. Evidence gaps and unresolved risks
 
@@ -107,7 +108,7 @@ Total play time on hardware is short: about 5 minutes in s5 and a few minutes in
 7. User documentation says the port has never run on a real PS2 (README, `docs/installing.md` compatibility table).
 8. ps2sdk `read()` and `write()` on `mass:` return **0, not an error**, on FatFs failure (`bdmfs_fatfs fs_read/fs_write`). A full stick or an I/O error looks like EOF or a short write. The game logs a warning and continues. A save interrupted this way is truncated: `O_TRUNC` already emptied the old one.
 9. Host tools in the build image (`apk add`) are not version-pinned. This may break bit-reproducibility later (known since H1).
-10. Licensing for distributing binaries (T6). Added after this plan was written: `libps2_drivers` (fjtrujy/ps2_drivers 2.0.0, linked into the ELF through SDL's PS2 backend) has a GPL-3.0 `LICENSE` file but LGPL v2 source headers; this is unresolved and blocks binary release. pthread-embedded is partly LGPL 2.1. See [license-compliance-matrix.md](license-compliance-matrix.md).
+10. Licensing for distributing binaries (T6). Added after this plan was written: `libps2_drivers` (fjtrujy/ps2_drivers 2.0.0, linked into the ELF through SDL's PS2 backend) has a GPL-3.0 `LICENSE` file but LGPL v2 source headers; this is unresolved and blocks binary release. pthread-embedded is partly LGPL 2.1. See [license-compliance-matrix.md](../license-compliance-matrix.md).
 
 ## 4. Investigation results
 
@@ -395,6 +396,20 @@ Use the `H4-RC1` zip and a freshly formatted stick (MBR + FAT32), prepared on a 
    - the setting is kept.
 7. `VVVVVV-nomusic.elf` boots and plays for 2 min.
 8. Keep `vvvvvv_ps2.log`. Copy `savedata/` sizes, not contents. Take photos of the PERF and DIAG pages.
+
+**Status after s7 (H4-RC1, 2026-10-27):**
+
+| Step | Status | Evidence |
+|---|---|---|
+| Prepared from the zip with `prepare-ps2-usb.py` | PASS | prepared and checked by the developer; the stick was the existing test stick, not freshly formatted |
+| 1. `fs_smoke.elf` | PENDING | no `fs_smoke.log` in the s7 folder |
+| 2. boot, no VRAM picture, title ≤ 10 s | PASS | first frame 7.95 s (log); no VRAM picture (tester report) |
+| 3. overlay `LAST ERR` empty | PASS (by log) | no WARN/ERROR line in the log; no overlay photo for s7 |
+| 4. ≥ 30 min play, audio counters | PENDING | the log covers about 30 s: 0 underruns, 0 late, period 34.3 ms in that window |
+| 5. D-pad, stick, unplug/replug | PENDING | stick and D-pad worked in s6 (P3.4.3); replug never tested |
+| 6. save, setting, full power-off, Continue | PASS | saves loaded and room restored (log); power-off (tester report); setting kept (`lang_set=2`) |
+| 7. `VVVVVV-nomusic.elf` | PENDING | not run |
+| 8. logs and photos kept | PASS (partial) | `logs/hw/2026-10-27-s7/`; no PERF/DIAG photos for s7 |
 
 ## 11. Release gates
 

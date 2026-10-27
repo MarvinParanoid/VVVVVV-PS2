@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lay out a USB stick for the first hardware sessions (docs/ps2-hardware-test-plan.md):
+# Lay out a USB stick for the first hardware sessions (docs/archive/ps2-hardware-test-plan.md):
 #
 #   [EXP_ID=P3.2-T1] scripts/make-hw-test-stick.sh <your data.zip> [<out-dir>]   (default build/usb-hw)
 #

@@ -127,7 +127,7 @@ Where we stand [V]:
 | Doom 3 [V] | `video::ConsoleStandard()` with the same ROM check, but boot uses a `host:presentation.cfg` file. The UI is a virtual 640×480 canvas scaled to 448 or 512 lines |
 | pcsx2oom [V] | The same ROM check (`GetRomName`, byte 4 == `'E'`), overridden by an ELF name ending in `PAL` or `NTSC`. The audio buffer also follows the mode |
 | CSE2 [V] | Hard-coded `SDL_HINT_PS2_GS_MODE "PAL"` (a custom SDL build; stock SDL 2.32 hard-codes NTSC) |
-| **VVVVVV-PS2** [V] | Always NTSC 640×448i ([installing.md](installing.md)) |
+| **VVVVVV-PS2** [V] | Always NTSC 640×448i ([installing.md](../installing.md)) |
 
 **Adoptable approach:**
 1. Default to auto, using the ROMVER byte 4 check.
@@ -347,7 +347,7 @@ The failures in the order they appeared [V: commits checked]:
 - Memory card:
   - the BIOS browser draws transparent icon texels black;
   - a save self-test failed two steps on console boots only (not investigated).
-- A PAL console forced to NTSC on a PAL-only TV over composite may lose colour. RGB SCART and component are fine. This matches [installing.md](installing.md).
+- A PAL console forced to NTSC on a PAL-only TV over composite may lose colour. RGB SCART and component are fine. This matches [installing.md](../installing.md).
 - Dead zone: a ramp up from zero, not a hard cutoff. A pad poll with no fresh data returns length 0; Q2 drops the analog input for that frame.
 
 ### 5.2 Changes to the recommendations

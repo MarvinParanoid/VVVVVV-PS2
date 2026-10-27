@@ -7,7 +7,7 @@
 **Related:**
 - [ps2-p3-report.md](ps2-p3-report.md)
 - [ps2-hardware-first-boot.md](ps2-hardware-first-boot.md) (printable checklist)
-- [ps2-usb-readme.txt](ps2-usb-readme.txt) (the README on the stick)
+- [ps2-usb-readme.txt](../ps2-usb-readme.txt) (the README on the stick)
 
 > **No physical PS2 was used.** Everything marked [M] was measured in PCSX2 v2.8.2 (BIOS SCPH-75001 v2.20, NTSC).
 >

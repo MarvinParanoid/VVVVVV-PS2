@@ -58,7 +58,7 @@ Tester releases (`scripts/make-public-test-release.sh`) ship **compiled PS2 ELF 
   - the notices of the libraries linked into the ELFs (`THIRD-PARTY-NOTICES.txt`);
   - the open-source `lang/` and `fonts/` files from the VVVVVV repository.
 - **Basis.** The VVVVVV Source Code License v1.0 permits non-commercial redistribution of altered versions, under the conditions above. The VVVVVV README adds that distributing a compiled version "might need permission first". This project has **no** written permission or licence exception from Terry Cavanagh. An informal discussion about a general exception for non-commercial ports is **not** an enacted exception and is not relied on here. Releases are non-commercial and clearly marked unofficial. **Review this before publishing a release.**
-- **Notices to check manually.** For newlib, the GCC runtime and FatFs, `THIRD-PARTY-NOTICES.txt` gives links instead of full licence texts.
+- **Notices.** `THIRD-PARTY-NOTICES.txt` and `LICENSES/` in each archive carry the full texts for newlib, FatFs and the LGPL components (pthread-embedded, audsrv); the GCC runtime is referenced by link. Open compliance items are listed in part B of `THIRD-PARTY-NOTICES.txt` and in [docs/license-compliance-matrix.md](docs/license-compliance-matrix.md).
 
 "PlayStation" and "PS2" are trademarks of Sony Interactive Entertainment. This
 project is not affiliated with or endorsed by Sony.

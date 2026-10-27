@@ -8,7 +8,7 @@
 #          SDL 2.32.10 + patches/sdl2 (scripts/build-sdl2-ps2.sh)
 # Output : out/vvvvvv-ps2/VVVVVV.elf plus lang/ and fonts/ from the source tree.
 #          No proprietary assets: data.zip must be supplied by the user and put
-#          next to the ELF (see docs/ps2-p2a-report.md).
+#          next to the ELF (see docs/archive/ps2-p2a-report.md).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 

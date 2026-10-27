@@ -8,7 +8,7 @@ How to build the PS2 ELFs, make a USB folder and run the game in PCSX2. To chang
 
 **Tools:** `bash`, `git`, `curl`, `patch`, `python3` (3.12+ for the bubblewrap backend; tested with 3.14), coreutils (`sha256sum`), and **either**:
 - [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): tested. The toolchain image is unpacked rootless into `~/.cache/vvvvvv-ps2/`;
-- or Docker: used by CI ([ci.md](ci.md)), not yet tested on a developer machine.
+- or Docker: used by CI ([releasing.md](releasing.md#continuous-integration)), where it has built successfully; not tested on a developer machine.
 
 **Disk and network.** About 2 GB of disk and a network connection for the first build: ~1.2 GB for the cached toolchain image and VVVVVV clone, ~0.7 GB in the repository's `build/` and `out/`. The build downloads:
 - the [ps2dev toolchain image](https://github.com/ps2dev/ps2dev/pkgs/container/ps2dev) (pinned by digest);
@@ -36,7 +36,30 @@ scripts/build-vvvvvv-ps2.sh --refetch  # VVVVVV + patches/vvvvvv     -> out/vvvv
 - the open-source `lang/` and `fonts/` folders;
 - `SOURCE.txt`, which lists the exact upstream revisions and patch hashes.
 
-**Reproducibility.** Builds are bit-for-bit reproducible. A fresh clone built with an empty cache produced the same ELFs as release candidate `H1-RC2`. Set `PS2_BUILD_ID=<name>` to stamp your own build ID; the default is `dev`.
+Set `PS2_BUILD_ID=<name>` to stamp your own build ID; the default is `dev`. `SOURCE.txt` also records the SHA-256 of both ELFs. `scripts/build-ps2-tests.sh` writes `build/ps2-tests-opt/BUILD-STAMP.txt` for `fs_smoke.elf`; release packaging checks both records.
+
+## Reproducibility
+
+What has been shown, on the build host (bubblewrap backend):
+- a clean worktree of tag `H3-FIRST-HARDWARE-PLAYABLE` (`b1e087c`) rebuilds the console-tested `P3.4.3-SAVEPAD` ELFs bit for bit (`VVVVVV.elf` `66f0568e…`);
+- `H4-RC1` built from clean checkouts of `784581b` and `a435397` gives identical ELFs (`VVVVVV.elf` `3fac5284…`).
+
+What has **not** been shown: identity across machines and between the bubblewrap and Docker backends. That comparison is pending ([releasing.md](releasing.md#continuous-integration)).
+
+The toolchain image is pinned by digest, SDL by SHA-256 and VVVVVV by commit. The host build tools inside the image (`apk add cmake make …`) are not pinned, so they can drift; `BUILD-INFO.txt` of every package lists their versions.
+
+**Reproducing a CI build locally.** From a clean checkout of the same commit:
+
+```sh
+id=ci-$(git rev-parse --short=12 HEAD)
+scripts/build-sdl2-ps2.sh
+PS2_BUILD_ID=$id scripts/build-vvvvvv-ps2.sh --refetch
+scripts/build-ps2-tests.sh
+EXP_ID=$id scripts/make-public-test-release.sh --ci "$id"   # -> build/public/VVVVVV-PS2-$id.zip
+scripts/build-host-tests.sh && scripts/run-host-tests.sh     # the host job
+```
+
+Then compare the ELF hashes in `out/vvvvvv-ps2/SOURCE.txt` with the "Unstripped ELFs" lines of the run's `BUILD-INFO.txt`.
 
 **How the patches are applied:**
 - `scripts/fetch-vvvvvv.sh` exports VVVVVV at the pinned commit into `build/vvvvvv-src/` and applies `patches/vvvvvv/`.
@@ -45,17 +68,15 @@ scripts/build-vvvvvv-ps2.sh --refetch  # VVVVVV + patches/vvvvvv     -> out/vvvv
 
 ## Continuous integration
 
-Every push to `main` and every pull request is built by GitHub Actions with these same scripts. The run produces:
-- an asset-free tester archive named after the commit (`ci-<sha>`);
-- its checksums and build metadata;
-- the host test results.
+Every push to `main` and every pull request is built by GitHub Actions with these same scripts. What runs, what it uploads and how release candidates are made: [releasing.md](releasing.md).
 
-[ci.md](ci.md) covers:
-- what runs and what is checked;
-- how to download and verify an artifact;
-- how to reproduce a CI build locally;
-- how release candidates are made;
-- the planned release workflow.
+## Tests
+
+- **Host:** `scripts/build-host-tests.sh && scripts/run-host-tests.sh`. Renderer checks against the host SDL, plus `fs_semantics`, which emulates ps2sdk's USB error codes against the real PhysicsFS.
+- **PS2 test programs:** `scripts/build-ps2-tests.sh` builds them into `build/ps2-tests-opt/`:
+  - `fs_smoke` (USB self-test);
+  - renderer checks;
+  - the file-system probes `stat_probe`, `write_probe`, `physfs_probe`, `io_bisect`, `sdl_bisect` that found the console bugs ([architecture.md](architecture.md#files-saves-and-the-ps2sdk-seams)).
 
 ## Make a USB folder
 
@@ -84,8 +105,9 @@ patches/sdl2/     PS2 changes to SDL 2.32.10
 scripts/          build, packaging, PCSX2 runners, benchmark and profiling tools
 tests/ps2/        standalone PS2 test programs (renderer checks, fs_smoke storage test)
 docker/           Dockerfile for the pinned ps2dev build image
-docs/             technical reports, hardware checklists, tester and on-stick READMEs
+docs/             user and developer documentation; archive/ holds the phase reports;
+                  release/, tester/ and ps2-usb-readme.txt are texts copied into packages
 LICENSES/         license texts (see LICENSE.md)
 ```
 
-The reports in `docs/` refer to `logs/`, `release/` and `build/` folders. Those are local outputs of the scripts and are not part of the repository.
+The documents refer to `logs/`, `release/` and `build/` folders. Those are local outputs of the scripts and are not part of the repository.

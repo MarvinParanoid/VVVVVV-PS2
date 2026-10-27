@@ -1,41 +1,14 @@
 # Installing and running on a PS2
 
-How to put the game on a USB stick, start it on a PlayStation 2, and report what happens. To build the ELFs yourself, see [building.md](building.md).
+How to put the game on a USB stick, start it on a PlayStation 2, and report what happens. To build the ELFs yourself, see [building.md](building.md). What has been tested, and the limitations: [known-issues.md](known-issues.md).
 
-## Compatibility
+## What you need
 
-The real-PS2 column comes from one console: a PlayStation 2 Slim SCPH-7500x (EU), Free McBoot, one 8 GB USB stick (MBR, FAT32), an official DualShock 2 and component video. It applies to builds from tag `H3-FIRST-HARDWARE-PLAYABLE` (build `P3.4.3-SAVEPAD`) on. **Older builds, including `H1-RC2` and `H2-TEST1`, hang on a real PS2** at the first missing file. Release candidate `H4-RC1` (commit `a435397`) was checked on that console on 2026-10-27: no warnings or errors in the log, saves kept across a full power-off, no leftover picture during loading. Other models and setups are untested.
-
-| Area | PCSX2 v2.8.2 | Real PS2 (SCPH-7500x, 1 console) |
-|---|---|---|
-| Boot from a USB stick folder, title screen | ✅ tested | ✅ tested; first frame ~8 s after boot |
-| Gameplay with DualShock 2 | ✅ tested (emulated pad) | ✅ D-pad, buttons and left analog stick |
-| Streamed music + sound effects | ✅ tested, 0 underruns | ✅ 0 underruns, no late audio submissions |
-| Save / continue (to the USB stick) | ✅ tested | ✅ saves written and loaded back, also after a full power-off |
-| Full game speed in normal rooms (29.4 ticks/s) | ✅ measured | ✅ 29.5 ticks/s, 10 s minimum 29.0 |
-| Tower / Panic Room worst case | ⚠️ ~25 of 29.4 ticks/s (85%) | ❓ unmeasured |
-| Flip Mode (upside-down option) | ✅ full speed in most scenes in `P3.2-T1`; slow in `H1-RC2` ([P3.1](ps2-p3.1-software-renderer-edge-cases.md)) | ❓ unmeasured |
-| Overlay, `fs_smoke`, exception screen | ✅ tested | ✅ overlay and `fs_smoke`; the exception screen appeared once (in a build before the fixes) |
-| NTSC video output on a PAL console | — | ✅ over component video on one TV |
-| Full or write-protected stick, controller unplugged and replugged, sessions over 30 minutes | — | ❓ untested |
-
-PCSX2 does not model the PS2's CPU caches or memory latency. On the tested console, normal rooms still run at full speed (34 ms per tick, of which about 18 ms is work). The heaviest scenes have not been measured there yet.
-
-**What the game includes:**
-- The full game in English: main game, time trials, Secret Lab and Super Gravitron. It is rendered by SDL2's software renderer and scaled to the screen by the GS.
-- All music, streamed from the USB stick, with sound effects.
-- DualShock 2 controls with PlayStation button glyphs in the menus.
-- Saves (`settings.vvv`, `unlock.vvv`, quicksave and teleporter saves) in a `savedata/` folder next to the game on the stick.
-
-## Known limitations
-
-- **NTSC only:** always 640×448 at 60 Hz, also on PAL consoles. Use a TV and cable that accept 60 Hz (RGB SCART, component). Over composite on a PAL-only TV the picture may be black and white or roll. There is no PAL mode yet.
-- **No memory-card saves.** Saves go to the USB stick only, so the game folder must be writable.
-- **USB mass storage only.** HDD, network and disc launches have not been tried.
-- **English only.** The CJK font sheets do not fit the GS texture limit. On the very first start the game still shows its language menu, with English as the only entry: press Cross. The choice is saved.
-- **Slowdown in the worst scenes.** The Tower and Panic Room run at about 85% speed in PCSX2 when the camera chases the player. Normal tower climbing is close to full speed.
-- **Music starts about 0.5 s** after a track change.
-- `over30mode` (interpolated 30+ FPS) is off by default. It can be enabled in the options but costs speed.
+- A PS2 that runs homebrew: Free McBoot (FMCB) or PS2BBL, with [wLaunchELF](https://github.com/ps2homebrew/wLaunchELF) or another ELF launcher that can open `mass:/`. Tested so far: one PS2 Slim SCPH-7500x with FMCB.
+- A USB stick, **FAT32 with an MBR partition table**, about 200 MB free. Smaller and older sticks are safest on the PS2's USB 1.1 ports.
+- A TV and cable that show **NTSC 60 Hz**: the game always outputs 640×448 at 60 Hz, also on PAL consoles. RGB SCART or component video are safest.
+- `data.zip` from your own copy of VVVVVV (see [Game data](#game-data)).
+- A PC with Python 3.8 or newer, to prepare the game folder.
 
 ## Game data
 
@@ -48,29 +21,27 @@ You never unpack or edit it by hand. The packaging tools:
 - make a PS2 copy, `data-ps2.zip`, in which the 61.7 MB music file is stored uncompressed so it can be streamed;
 - only read your original.
 
-Only one `data.zip` has been tested so far.
+Only the full game's `data.zip` has been tested so far.
 
 **Do not share** `data.zip`, `data-ps2.zip` or a USB folder that contains them.
 
-## Preparing the USB stick
+## Preparing the game folder
 
-There are two ways to get a game folder.
+### From a release archive
 
-### From a tester release (no development tools needed)
+**No GitHub Release has been published yet.** Release candidates are built with `scripts/make-public-test-release.sh --release` ([releasing.md](releasing.md)). The archive `VVVVVV-PS2-<name>.zip` contains **no game data**.
 
-**No tester release has been published yet.** When one is, it will be a zip on the [Releases](https://github.com/MarvinParanoid/VVVVVV-PS2/releases) page **without any game data**.
+1. Unzip it on your PC. Optional: `sha256sum -c SHA256SUMS` inside the unzipped folder.
+2. Add your game data:
 
-You will need:
-- a PC with Python 3.8+ (Windows, Linux or macOS);
-- `data.zip` from your own copy of VVVVVV.
+   ```sh
+   python3 tools/prepare-ps2-usb.py /path/to/data.zip usb/VVVVVV      # Windows: py tools\prepare-ps2-usb.py ...
+   ```
 
-**Steps:**
-1. Unzip the release.
-2. Run `python3 tools/prepare-ps2-usb.py /path/to/data.zip usb/VVVVVV usb/VVVVVV-P31DEV`. On Windows, use `py tools\prepare-ps2-usb.py ...`.
-3. Copy the folders inside `usb/` to the root of the stick.
-4. Follow `TESTING.txt` from the zip. The first session takes about 15 minutes.
+   It must end with `ready: usb/VVVVVV`.
+3. Copy `usb/VVVVVV` to the stick (below).
 
-The archive's `README.txt` and `TESTING.txt` come from [docs/tester/](tester/).
+The archive's `README.txt` ([docs/release/README.txt](release/README.txt)) contains the same steps.
 
 ### From a source build
 
@@ -82,34 +53,38 @@ scripts/make-usb-package.sh /path/to/your/data.zip
 #   it must end with "checksums OK" and no "FAT32 problem" lines
 ```
 
-The folder contains:
-- `VVVVVV.elf`, `VVVVVV-nomusic.elf` and `fs_smoke.elf`;
-- `data-ps2.zip`, `lang/` and `fonts/`;
-- `README-PS2.txt`, a short on-stick guide;
+### What the folder contains
+
+- `VVVVVV.elf`: the game;
+- `VVVVVV-nomusic.elf`: the same game without music, as a fallback;
+- `fs_smoke.elf`: USB self-test, run it first;
+- `data-ps2.zip`: made from your `data.zip`;
+- `lang/`, `fonts/`: open-source files from the VVVVVV repository;
+- `README-PS2.txt`: a short on-stick guide;
+- `SOURCE.txt`: build ID and exact source versions;
+- `MANIFEST.sha256`: checksums of everything;
 - `optional/bench.txt` and `optional/overlay.txt`.
 
-### Copying to the stick
+## Copying to the stick
 
-1. Use a **FAT32** stick with an **MBR** partition table, with about 200 MB free. Smaller and older sticks are safest on the PS2's USB 1.1 ports.
-2. Copy the whole game folder to the **root** of the stick, so you have `/VVVVVV/VVVVVV.elf`.
-3. Check the copy, then eject safely:
+1. Copy the whole `VVVVVV` folder to the **root** of the stick, so that it contains `/VVVVVV/VVVVVV.elf`.
+2. Check the copy, then eject safely:
 
    ```sh
    cd /run/media/$USER/<STICK>/VVVVVV && sha256sum -c --quiet MANIFEST.sha256 && echo OK
    ```
 
+The game writes its saves (`savedata/`) and its log (`vvvvvv_ps2.log`) into this folder, so the stick must stay writable. Several game folders with different names can sit side by side; each keeps its own saves.
+
 ## Launching with FMCB and wLaunchELF
 
-You need a way to run homebrew, e.g. a memory card with Free McBoot (FMCB) or PS2BBL, and [wLaunchELF](https://github.com/ps2homebrew/wLaunchELF).
+**Before power-on:** DualShock 2 in port 1, the stick in a USB port (the tested setup used a front port).
 
-**Before power-on:** FMCB card in slot 1, DualShock 2 in port 1, the stick in a **front** USB port.
-
-1. Boot into wLaunchELF.
-2. **Storage test first:** FileBrowser → `mass:/` → `VVVVVV/` → `fs_smoke.elf`. It should end with **ALL OK**. Photograph the screen, then reset.
-3. **The game:** start `mass:/VVVVVV/VVVVVV.elf`. A white start-up list appears. Its first line shows the build ID. Then the title screen follows.
-4. If audio misbehaves, try `VVVVVV-nomusic.elf`.
-
-The full printable session checklist is [ps2-hardware-first-boot.md](ps2-hardware-first-boot.md). The developer's multi-session plan is [ps2-hardware-test-plan.md](ps2-hardware-test-plan.md).
+1. Boot into wLaunchELF (from the FMCB menu).
+2. **Storage test first:** FileBrowser → `mass:/` → `VVVVVV/` → `fs_smoke.elf`. It should end with **ALL OK**. On the tested console it ends with PROBLEMS, listing only `opendir(".")`: that one is a known issue ([known-issues.md](known-issues.md#technical-debt)). Any other failed check matters. Reset.
+3. **The game:** start `mass:/VVVVVV/VVVVVV.elf`. A white start-up list appears (its first line shows the build ID), then the game.
+4. On the very first start the game asks for the language. Only English is included: press ✕. The choice is saved.
+5. If audio misbehaves, try `VVVVVV-nomusic.elf`.
 
 ### Controls
 
@@ -121,37 +96,42 @@ The full printable session checklist is [ps2-hardware-first-boot.md](ps2-hardwar
 | △ | map |
 | □ | interact |
 | R1 | restart |
-| **L3+R3** (press both sticks) | diagnostics overlay |
+| **L3+R3** (press both sticks) | diagnostics overlay: off → compact → performance page → diagnostics page |
 
-### Diagnostic files
+### Optional files
 
-Copy these next to the ELF to enable them:
-- `optional/overlay.txt`: start with the overlay on;
-- `optional/bench.txt`: run a ~4-minute hands-off benchmark that writes `bench_results.txt`. Delete it afterwards to play normally.
+Copy these from `optional/` next to `VVVVVV.elf` to enable them:
+- `overlay.txt`: start with the compact overlay on;
+- `bench.txt`: run a ~4-minute hands-off benchmark that writes `bench_results.txt`. Delete it afterwards to play normally.
 
-What the overlay shows is described in [ps2-hardware-diagnostics.md](ps2-hardware-diagnostics.md) (for the newer overlay) and [ps2-h1-hardware-readiness.md](ps2-h1-hardware-readiness.md) (for the overlay in `H1-RC2`).
+## If something fails
 
-### If something fails
-
-- A **FATAL ERROR** or **CPU EXCEPTION** screen stays up. Photograph it whole.
-- A hang on the start-up list shows the last step reached.
-- If `mass:/` is empty, check that the stick is FAT32 with MBR, plugged in before power-on, in a front port; try another, smaller stick.
+| What you see | What to do |
+|---|---|
+| `mass:/` is empty or the folder is missing | The stick must be FAT32 with an MBR partition table and plugged in before power-on. Try the other port and another, smaller stick |
+| `fs_smoke.elf` lists a failed check other than `opendir(".")` | Photograph the screen; the game will probably not run from this stick |
+| The start-up list stops at a step | Photograph it: the last line shows where it hangs |
+| A **FATAL ERROR** or **CPU EXCEPTION** screen | Photograph it whole. Keep `vvvvvv_ps2.log` from the stick |
+| Black screen, but other software shows a picture | The TV or cable does not accept NTSC 60 Hz |
+| Saves are empty or lost | Check that the stick is not full or write-protected; report it |
+| An old build hangs after "SDL started" | Builds before `H3-FIRST-HARDWARE-PLAYABLE` (`H1-RC2`, `H2-TEST1`) hang on a console; use a current build |
 
 ## Reporting hardware test results
 
 Please open an issue with the **Hardware test report** template. Include:
-- console model;
+- console model (sticker on the bottom) and region;
 - launcher;
-- USB stick;
+- USB stick and port;
 - TV and cable;
-- the build ID;
+- the build ID (first line of the start-up list, or `SOURCE.txt`);
 - photos of any error screen;
-- the files the game writes into its folder on the stick: `fs_smoke.log`, `vvvvvv_ps2.log`, `bench_results.txt`.
+- the files the game writes into its folder on the stick: `fs_smoke.log`, `vvvvvv_ps2.log`, `bench_results.txt` (if you ran it);
+- if saves misbehave: the names and sizes of the files in `savedata/saves/`. Send the save files themselves only if a developer asks and you agree.
 
 Failures are just as useful as successes. **Do not attach any game data.** See [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 **Crash addresses.** An exception screen shows `EPC` and `RA` addresses. Developers can turn them into function names with the unstripped ELF of the same build:
 
 ```sh
-scripts/ps2-profile.py out/vvvvvv-ps2/VVVVVV.elf --addr <EPC> <RA>
+scripts/ps2-profile.py <unstripped VVVVVV.elf> --addr <EPC> <RA>
 ```

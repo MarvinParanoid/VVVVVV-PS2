@@ -22,7 +22,7 @@
 # anything that looks like game data, a BIOS, a secret or a build cache, and
 # then checks the finished zip.
 #
-# --ci: the archive for one CI build (.github/workflows/ci.yml, docs/ci.md):
+# --ci: the archive for one CI build (.github/workflows/ci.yml, docs/releasing.md):
 # only usb/VVVVVV-CI/, the build $EXP_ID from out/vvvvvv-ps2, with
 # README-CI.txt. No frozen release candidate and no GSPOC: a CI archive never
 # contains binaries it did not build.

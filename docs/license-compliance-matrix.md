@@ -60,7 +60,7 @@ Licence evidence (fjtrujy/ps2_drivers):
 
 ## What this means for H4
 
-1. **Blocker (new):** the `ps2_drivers` licence must be clarified before any binary is published. H2-TEST1 was never published, so nothing has been distributed yet.
+1. **Blocker (new):** the `ps2_drivers` licence must be clarified before any binary is published. H2-TEST1 was never published. However, every CI run on `main` so far (`1711c68`, `fb61092`, `742a7ce`) uploaded the CI archive and the unstripped ELFs as workflow artifacts. The repository is public, so any signed-in GitHub user can download them until they expire (2026-11-22/25).
 2. **Done in the `--release` packaging (2026-10-26):** `THIRD-PARTY-NOTICES.txt` and `LICENSES/` carry LGPL 2.0 (audsrv) and 2.1 (pthread-embedded) texts with source pointers, the FatFs licence and `COPYING.NEWLIB`, and state the ps2_drivers item as unresolved.
 3. **Existing permission:** the VVVVVV licence text already permits a non-commercial, altered, asset-free binary release with the required notices. Approval is needed only for the assets, or if the user wants explicit consent as the upstream README suggests.
 4. **Never without written approval:** game assets (except a future Make and Play build under its general exception).

@@ -15,7 +15,7 @@
 #
 # - FLAG_FILES="overlay storage_real crashtest snapshots": create <name>.txt
 #   (<name>=<text> writes <text> into it, e.g. crashtest=badsp)
-#   next to the ELF (switches read at start-up, see docs/ps2-h1-hardware-readiness.md).
+#   next to the ELF (switches read at start-up, see docs/archive/ps2-h1-hardware-readiness.md).
 # - PCSX2_OSD_FPS=1: PCSX2 on-screen FPS/VPS/speed overlay (in the window,
 #   not in the GS snapshots).
 # - Stages build/vvvvvv-run/ = out/vvvvvv-ps2/* + a symlink to your data.zip

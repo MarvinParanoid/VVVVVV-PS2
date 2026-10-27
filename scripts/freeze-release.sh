@@ -29,7 +29,7 @@ rel="$(realpath --relative-to="$REPO" "$REL")"
 cp -r "$REPO/out/vvvvvv-ps2/lang" "$REPO/out/vvvvvv-ps2/fonts" "$REL/files/"
 cp "$REPO/out/vvvvvv-ps2/SOURCE.txt" "$REL/SOURCE.txt"
 cp "$REPO/scripts/make-usb-package.sh" "$REPO/scripts/repack-data-zip.py" "$REL/"
-cp "$REPO/docs/ps2-hardware-first-boot.md" "$REL/FIRST-BOOT.md"
+cp "$REPO/docs/installing.md" "$REL/INSTALLING.md"
 cp "$REPO/docs/ps2-usb-readme.txt" "$REL/README-PS2.txt"
 cat > "$REL/BUILD.md" <<EOT
 # VVVVVV-PS2-$ID
@@ -52,8 +52,8 @@ Symbolise a crash address from the exception screen:
 
     scripts/ps2-profile.py release/VVVVVV-PS2-$ID/symbols/VVVVVV.elf --addr <EPC> <RA>
 
-See FIRST-BOOT.md for the test procedure and docs/ps2-h1-release-candidate.md
-in the repository for the validation results.
+See INSTALLING.md for installing and testing on a console, and
+docs/releasing.md in the repository for release candidates and their checks.
 EOT
 (cd "$REL" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 chmod -R a-w "$REL"

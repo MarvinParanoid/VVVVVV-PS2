@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for testing on a real console! The steps are in `TESTING.txt` of the tester release.
+        Thank you for testing on a real console! The steps are in `docs/installing.md` and in the `README.txt` of the release archive.
         Partial results are welcome: if it stopped at step 1, report step 1.
         **Never attach `data.zip`, `data-ps2.zip`, whole game folders or extracted game graphics, sounds or music.**
   - type: input
@@ -37,7 +37,7 @@ body:
     id: release
     attributes:
       label: Release and build IDs
-      description: Release archive name (e.g. VVVVVV-PS2-H2-TEST1) and the build ID shown on the start-up list (H1-RC2 / the experimental one).
+      description: Archive name (e.g. VVVVVV-PS2-H4-RC1), or "own build", and the build ID shown on the start-up list.
     validations:
       required: true
   - type: dropdown
@@ -52,12 +52,11 @@ body:
     validations:
       required: true
   - type: dropdown
-    id: session1
+    id: game
     attributes:
-      label: Session 1 - H1-RC2 (folder VVVVVV)
+      label: The game (VVVVVV.elf)
       options:
-        - Played normally, benchmark done
-        - Played normally, benchmark not run or not finished
+        - Played normally
         - Title screen, but problems in game
         - Stopped on the start-up list
         - FATAL ERROR screen
@@ -67,31 +66,29 @@ body:
     validations:
       required: true
   - type: dropdown
-    id: session2
+    id: saves
     attributes:
-      label: Session 2 - experimental build (folder VVVVVV-P31DEV)
+      label: Save and Continue
       options:
-        - All three benchmarks done
-        - Played, some benchmarks done
-        - Problems (describe below)
-        - Not run
-    validations:
-      required: true
+        - Worked, also after switching the console off
+        - Worked (console not switched off in between)
+        - Saves lost or empty (describe below)
+        - Not tried
   - type: dropdown
-    id: session3
+    id: benchmark
     attributes:
-      label: Session 3 - GSPOC (optional)
+      label: Benchmark (optional/bench.txt)
       options:
         - Not run
-        - Both programs ran (logs attached)
+        - Done (bench_results.txt attached)
         - Problems (describe below)
   - type: textarea
     id: observations
     attributes:
       label: What you saw and heard
       description: |
-        Controls, graphics, music and sound (clicks? gaps?), overlay values (L3+R3: TPS, FRAME, FREE),
-        save/continue, Flip Mode, time from launch to title. For a failure: the last line of the
+        Controls (D-pad, left stick, unplugging the pad), graphics, music and sound (clicks? gaps?),
+        overlay values (L3+R3: TPS, FRAME, HEAP), Flip Mode, time from launch to title, how long you played. For a failure: the last line of the
         start-up list, what you did just before, how long you waited.
     validations:
       required: true
@@ -100,6 +97,6 @@ body:
     attributes:
       label: Logs, results and photos
       description: |
-        Drag files here: fs_smoke.log, vvvvvv_ps2*.log, bench_results*.txt (and GSPOC logs).
+        Drag files here: fs_smoke.log, vvvvvv_ps2*.log, bench_results*.txt.
         Photos of the fs_smoke screen and of any FATAL ERROR / CPU EXCEPTION screen (whole screen, readable).
         If no files were written on the stick, say so - photos and notes are enough.

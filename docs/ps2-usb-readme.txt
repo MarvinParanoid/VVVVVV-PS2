@@ -28,6 +28,8 @@ Contents (copy the whole VVVVVV folder to the ROOT of a FAT32 USB stick)
   wLaunchELF -> FileBrowser -> mass:/ -> VVVVVV/ -> fs_smoke.elf
   A text screen lists each check; it ends with ALL OK or PROBLEMS plus the
   names of failed checks. It also writes fs_smoke.log into the folder.
+  On the tested console opendir(".") is reported as failed; that one is a
+  known issue.
   Photograph the screen, then reset the console.
 
 2. The game
@@ -38,11 +40,15 @@ Contents (copy the whole VVVVVV folder to the ROOT of a FAT32 USB stick)
   EXCEPTION screen stays up instead: photograph it, then reset.
 
 3. Diagnostic overlay
-  Press L3 + R3 together (both sticks down) to show/hide a small panel:
-    TPS actual/target  FRAME ms  RND (render) ms
-    MUSIC on/off  decode ms per second  UNDERRUN count  FREE memory MB
-    STATUS OK, or the last error
-  Values update once a second. TPS 29.4 is full game speed.
+  Press L3 + R3 together (both sticks down) to step through four modes:
+    OFF
+    COMPACT  one line: TPS (ticks per second), PCM underruns, free HEAP
+    PERF     TPS and 10 s average/minimum, FRAME and RENDER ms, MUSIC
+             (decode ms per second, PCM UR underruns), HEAP FREE
+    DIAG     FLIP MODE, STORAGE (log writes ok/fail), AUDSRV Q (audio
+             queue), SUBMIT (late audio), DRY EST, LAST ERR
+  and back to OFF. Values update once a second. TPS 29.4 is full game
+  speed. For a report, photograph the PERF and DIAG pages.
 
 4. Benchmark (no input needed, about 4 minutes)
   Copy optional/bench.txt into the VVVVVV folder and start VVVVVV.elf.
@@ -67,7 +73,9 @@ Controls
   Triangle = map, Square = interact, R1 = restart, L3+R3 = overlay.
 
 What to send back (copy from the stick on a PC)
-  fs_smoke.log, vvvvvv_ps2.log, bench_results.txt (if you ran it), and the
-  savedata/ folder; photos of any error screen; console model, wLaunchELF
+  fs_smoke.log, vvvvvv_ps2.log, bench_results.txt (if you ran it); if saves
+  misbehave, the names and sizes of the files in savedata/saves/ (send the
+  save files themselves only if a developer asks and you agree); photos of
+  any error screen; console model, wLaunchELF
   version, USB stick model and size. The log is written about every 10 s,
   so the last seconds before a crash may be missing.

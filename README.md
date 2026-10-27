@@ -1,69 +1,49 @@
 # VVVVVV for PlayStation 2
 
 An unofficial, non-commercial homebrew port of Terry Cavanagh's
-[VVVVVV](https://github.com/TerryCavanagh/VVVVVV) to the PlayStation 2, built
-from the open-source VVVVVV code with SDL2 and the [ps2dev](https://github.com/ps2dev) toolchain.
-It runs on a real PlayStation 2: so far tested on **one console** (PS2 Slim
-SCPH-7500x, Free McBoot, USB stick), at full game speed with music and saves.
-It is also playable in the PCSX2 emulator.
+[VVVVVV](https://github.com/TerryCavanagh/VVVVVV) to the PlayStation 2. It is
+built from the open-source VVVVVV code with SDL2 and the
+[ps2dev](https://github.com/ps2dev) toolchain, and runs from a USB stick.
 
-The game's graphics, sounds and music are not included. You need `data.zip`
-from your own copy of VVVVVV; if you enjoy the game, please buy it at
-[thelettervsixtim.es](https://thelettervsixtim.es).
+**No GitHub Release has been published yet.** The current release candidate is
+`H4-RC1`; see [docs/releasing.md](docs/releasing.md) for its status.
 
-## Status
+## What works
 
-Working on the tested console and in PCSX2:
-- the full game in English, including time trials, the Secret Lab and the Super Gravitron;
-- music and sound effects;
-- DualShock 2 controls: D-pad, buttons and the left analog stick;
-- saves to the USB stick;
-- diagnostic tools for hardware testing: start-up and error screens, a performance overlay, a benchmark and a USB self-test.
+- The full game in English: main game, time trials, Secret Lab, Super Gravitron.
+- Streamed music and sound effects.
+- DualShock 2: D-pad, buttons and the left analog stick.
+- Saves on the USB stick, including Continue.
+- Diagnostics for testers: a start-up screen, error and exception screens, a performance overlay (L3+R3), a benchmark and a USB self-test.
 
-First results on the console: 29.5 game ticks per second against the game's
-29.4, no audio dropouts, saves written and loaded back. The first console
-sessions found five bugs that PCSX2 cannot show: start-up hang, empty save
-files, dead analog stick, a missing language entry and leftover video memory
-at start-up. All five are fixed. Builds from before these fixes, including
-`H1-RC2` and `H2-TEST1`, hang on a real PS2.
+## Tested hardware
 
-Main limitations:
-- Only one console model, one USB stick and one controller have been tested.
-- The most demanding scenes (the Tower, the Panic Room) run at about 85% speed in PCSX2; they have not been measured on the console yet.
-- Video is NTSC (60 Hz) only, also on PAL consoles.
-- Saves go to the USB stick; there are no memory-card saves.
+One console so far: a **PS2 Slim SCPH-7500x** (EU) with Free McBoot, an 8 GB
+FAT32 USB stick, an official DualShock 2 and component video. On it:
+- **Speed:** the game runs at full speed (29.5 of 29.4 logic ticks per second in normal rooms).
+- **Audio:** no audio dropouts.
+- **Saves:** written, restored by Continue, kept after a full power-off.
 
-The full compatibility table and the other limitations are in [docs/installing.md](docs/installing.md#compatibility).
+Not yet checked on the console:
+- the heaviest scenes;
+- long sessions;
+- controller reconnection.
 
-## Getting started
+Other models are untested. Details: [docs/known-issues.md](docs/known-issues.md).
 
-No tester release has been published yet. Once one is, it will appear on the
-[Releases](https://github.com/MarvinParanoid/VVVVVV-PS2/releases) page as a zip
-without game data, together with a small Python script that adds the data from
-your own `data.zip`. No development tools will be needed. Until then, the game
-has to be [built from source](#building-from-source).
+Builds before tag `H3-FIRST-HARDWARE-PLAYABLE`, including `H1-RC2` and
+`H2-TEST1`, hang on a real PS2.
 
-In short:
-1. Take `data.zip` from your copy of VVVVVV (Steam, GOG, itch.io; or the free Make and Play edition for personal use).
-2. Prepare the game folder from it and copy the folder to the root of a FAT32 (MBR) USB stick.
-3. On a PS2 that runs homebrew (FMCB or PS2BBL with wLaunchELF), run `mass:/VVVVVV/fs_smoke.elf` first, then `mass:/VVVVVV/VVVVVV.elf`.
+## Running it
 
-Step-by-step instructions, controls and troubleshooting: [docs/installing.md](docs/installing.md).
-A printable checklist for a first session: [docs/ps2-hardware-first-boot.md](docs/ps2-hardware-first-boot.md).
+1. Get a game folder: either from a release archive (none published yet) plus your own `data.zip`, or by building it from source.
+2. Copy the folder to a FAT32 (MBR) USB stick.
+3. Start `mass:/VVVVVV/VVVVVV.elf` from wLaunchELF on a PS2 that runs homebrew (FMCB or PS2BBL).
 
-### Testing on real hardware
+Step-by-step instructions, controls and troubleshooting:
+[docs/installing.md](docs/installing.md).
 
-A report from a real console is the most useful contribution right now,
-especially from other models (fat consoles, other regions, other USB sticks).
-Failures are as useful as successes. Please open an issue with the
-**Hardware test report** template. Never attach game data; see
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Building from source
-
-On Linux x86-64 with [bubblewrap](https://github.com/containers/bubblewrap)
-(or Docker, untested). The scripts download a pinned ps2dev toolchain image,
-SDL 2.32.10 and VVVVVV, and apply this repository's patches:
+Building from source needs Linux x86-64 with bubblewrap or Docker:
 
 ```sh
 git clone https://github.com/MarvinParanoid/VVVVVV-PS2.git
@@ -73,28 +53,50 @@ scripts/build-vvvvvv-ps2.sh --refetch            # -> out/vvvvvv-ps2/VVVVVV.elf
 scripts/make-usb-package.sh /path/to/data.zip    # -> build/usb-package/VVVVVV/
 ```
 
-Requirements, reproducible builds and running in PCSX2: [docs/building.md](docs/building.md).
-Changing the patches: [CONTRIBUTING.md](CONTRIBUTING.md).
+More: [docs/building.md](docs/building.md).
+
+## Game data
+
+The game's graphics, sounds and music are **not** included. Use `data.zip`
+from your own copy of VVVVVV:
+- from the game's install folder (Steam, GOG, itch.io and similar);
+- or, for personal use, from the free [Make and Play Edition](https://thelettervsixtim.es/makeandplay/).
+
+If you enjoy the game, please buy it at [thelettervsixtim.es](https://thelettervsixtim.es).
+Never share `data.zip` or a prepared game folder.
+
+## Limitations
+
+- NTSC 60 Hz output only, also on PAL consoles.
+- USB storage only; no memory-card saves.
+- English only.
+- The Tower and the Panic Room run at about 85% speed in PCSX2; not yet measured on the console.
+
+The full list: [docs/known-issues.md](docs/known-issues.md).
 
 ## Documentation
 
-- [Installing and running on a PS2](docs/installing.md)
-- [Hardware test plan](docs/ps2-hardware-test-plan.md)
-- [Building from source](docs/building.md)
-- [Technical overview](docs/technical-overview.md): how the port works
-- [Diagnostics overlay](docs/ps2-hardware-diagnostics.md)
-- [All documents and the development history](docs/README.md)
+| Document | For |
+|---|---|
+| [docs/installing.md](docs/installing.md) | putting the game on a stick, launching, controls, reporting results |
+| [docs/known-issues.md](docs/known-issues.md) | compatibility, limitations, open questions |
+| [docs/building.md](docs/building.md) | building, tests, PCSX2, reproducibility |
+| [docs/architecture.md](docs/architecture.md) | how the port works |
+| [docs/releasing.md](docs/releasing.md) | release candidates, CI, release gates |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | hardware reports and code changes |
+| [docs/archive/](docs/archive/README.md) | phase reports and earlier plans (historical) |
 
 ## License and credits
 
-This is an altered, unofficial version of VVVVVV. It is not affiliated with or
-endorsed by Terry Cavanagh or Sony, and it is non-commercial.
+This is an altered, unofficial version of VVVVVV. It is not affiliated with
+or endorsed by Terry Cavanagh or Sony, and it is non-commercial.
 
 The repository has mixed licensing: the VVVVVV patches use the VVVVVV Source
 Code License (non-commercial), the SDL and PhysicsFS patches use zlib, and the
-tooling and documentation use MIT. See [LICENSE.md](LICENSE.md) for details,
-including the terms for built binaries. No game assets are included, and
-`data.zip` must not be redistributed.
+tooling and documentation use MIT. See [LICENSE.md](LICENSE.md), including the
+terms for built binaries. No game assets are included, and `data.zip` must not
+be redistributed. Open licensing questions for binary releases are tracked in
+[docs/license-compliance-matrix.md](docs/license-compliance-matrix.md).
 
 Credits:
 - **VVVVVV** by [Terry Cavanagh](https://distractionware.com), with music by Magnus Pålsson (SoulEye). The VVVVVV source code is © Terry Cavanagh.

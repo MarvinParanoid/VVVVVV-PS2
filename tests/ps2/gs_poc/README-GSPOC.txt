@@ -2,7 +2,7 @@ G1 GS renderer feasibility prototypes - OPTIONAL, research only
 ================================================================
 Not part of the game. They draw synthetic VVVVVV-like scenes (generated in
 code, no game data) and measure rendering costs. Details:
-docs/ps2-gs-renderer-feasibility.md in the repository.
+docs/archive/ps2-gs-renderer-feasibility.md in the repository.
 
 Order (each writes its log into this folder):
  1. gs_poc_sw.elf  software renderer (path A), about 1-2 minutes. It writes

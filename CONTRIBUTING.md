@@ -1,7 +1,9 @@
 # Contributing
 
 Thanks for your interest! The most valuable contribution right now is a
-**test on a real PlayStation 2**. The port has only run in PCSX2 so far.
+**test on a real PlayStation 2**. The port has been tested on one console
+model only (see [docs/known-issues.md](docs/known-issues.md)), so reports from
+other models, regions and USB sticks help most.
 
 ## Hardware test reports
 
@@ -10,14 +12,14 @@ Use the **Hardware test report** issue template. A useful report contains:
 - how you launched it (FMCB / FreeHDBoot / PS2BBL, wLaunchELF version, etc.);
 - USB stick model and size, and the port you used;
 - TV, cable and video mode;
-- the build ID shown on the start-up screen (e.g. `H1-RC2`, or `dev` for your own build);
+- the build ID shown on the start-up screen (e.g. `H4-RC1`, or `dev` for your own build);
 - the `fs_smoke` result screen, and photos of any error screen;
 - the files from the game folder on the stick:
   - `fs_smoke.log`;
   - `vvvvvv_ps2.log`;
   - `bench_results.txt` (if you ran the benchmark).
 
-The checklist in [docs/ps2-hardware-first-boot.md](docs/ps2-hardware-first-boot.md) walks through a full session.
+[docs/installing.md](docs/installing.md) walks through a session, and [docs/releasing.md](docs/releasing.md#hardware-check-of-a-release-candidate) lists the full release-candidate check.
 
 **Never attach or upload VVVVVV game data.** That means `data.zip`, `data-ps2.zip`, extracted graphics, sounds or music. Screenshots and photos of the game are fine in issues.
 

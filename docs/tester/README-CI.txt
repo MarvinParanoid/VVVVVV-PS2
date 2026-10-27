@@ -3,11 +3,11 @@ VVVVVV for PlayStation 2 - automated development build (CI)
 
 THIS IS AN UNTESTED DEVELOPMENT BUILD. It was built automatically from one
 commit of https://github.com/MarvinParanoid/VVVVVV-PS2 (BUILD-INFO.txt names
-the commit and the build ID). Nobody has run this exact build, and the port
-has not run on a real PS2 yet: it was tested only in the PCSX2 emulator.
-This is not a release candidate. For a planned test session, use a tester
-release instead; this archive is for developers and for checking a specific
-change.
+the commit and the build ID). Nobody has run this exact build. The port has
+been played on one console model (see docs/known-issues.md in the
+repository), but a CI build is not a release candidate. For a planned test
+session, use a release-candidate archive; this archive is for developers and
+for checking a specific change.
 
 This is an unofficial, altered version based on the VVVVVV source code
 (https://github.com/TerryCavanagh/VVVVVV). VVVVVV is copyright Terry

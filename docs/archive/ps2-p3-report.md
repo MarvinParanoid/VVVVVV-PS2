@@ -431,7 +431,7 @@ scripts/make-usb-package.sh <your data.zip> [<out-dir>] [--no-build] [--image <f
 - `fs_smoke.elf`;
 - `data-ps2.zip`, repacked from **your** `data.zip`; the input is not modified, and the music blob's SHA-256 is verified;
 - `lang/`, `fonts/`;
-- `README-PS2.txt` ([docs/ps2-usb-readme.txt](ps2-usb-readme.txt));
+- `README-PS2.txt` ([docs/ps2-usb-readme.txt](../ps2-usb-readme.txt));
 - `SOURCE.txt`, with the sha256 of the unstripped ELFs for symbolising crash addresses;
 - `MANIFEST.sha256`.
 

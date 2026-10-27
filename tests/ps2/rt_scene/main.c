@@ -1,6 +1,6 @@
 /* rt_scene: replicas of real VVVVVV 2.4.4 frames, built from per-frame
  * operation counts read out of the game's render code (see
- * docs/ps2-p1-report.md section "Real workload"), timed on the full Option A
+ * docs/archive/ps2-p1-report.md section "Real workload"), timed on the full Option A
  * path (software renderer -> 320x240 XBGR8888 texture framebuffer -> GS).
  *
  * The *counts* are estimates derived from the game source; the *times* are
