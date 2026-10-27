@@ -1,9 +1,13 @@
 # Build the PS2 ELFs from a clean checkout, run the host checks and produce
 # the asset-free CI test archive. How it works and how to download the
-# results: docs/ci.md. No game data, BIOS or secrets are used or uploaded.
+# results: docs/releasing.md. No game data, BIOS or secrets are used or uploaded.
 # A tag H<n>-RC<m> (or a manual run with a release name) builds that release
 # candidate's end-user archive instead (docs/releasing.md). It is uploaded as
 # a workflow artifact only: nothing is published as a GitHub release.
+# Executables (the archive and the unstripped ELFs) are uploaded only when the
+# repository variable UPLOAD_EXECUTABLES is "true": while a licence question is
+# open (docs/license-compliance-matrix.md), runs upload only the metadata,
+# which names every ELF and archive checksum.
 name: CI
 
 on:
@@ -120,7 +124,12 @@ jobs:
           cp out/vvvvvv-ps2/SOURCE.txt "$B/metadata/SOURCE.txt"
           { echo '```'; cat "$B/$N/BUILD-INFO.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Executables are not uploaded (UPLOAD_EXECUTABLES is not "true")
+        if: vars.UPLOAD_EXECUTABLES != 'true'
+        run: echo "Not uploading the archive or the ELFs; checksums are in the metadata artifact and the job summary." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload the tester archive
+        if: vars.UPLOAD_EXECUTABLES == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: build/public/VVVVVV-PS2-${{ steps.id.outputs.build }}.zip
@@ -137,6 +146,7 @@ jobs:
           retention-days: 30
 
       - name: Upload unstripped ELFs (crash symbolisation)
+        if: vars.UPLOAD_EXECUTABLES == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: symbols-${{ steps.id.outputs.build }}
